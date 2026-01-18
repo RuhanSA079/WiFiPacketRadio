@@ -1,0 +1,54 @@
+Scratchpad notes on the hlk7628 device:  
+
+WAN port config:
+
+---- Console configuration ----
+Temporary solution to reach device over network.
+Baudrate: 57600
+
+Switching first ethernet port from WAN "vlan" to LAN "vlan"
+swconfig dev switch0 vlan 1 set ports "0 1 2 3 4 6t"
+swconfig dev switch0 set apply
+
+Device should be reachable/pingable on 192.168.1.1
+
+---- LuCI configuration ----
+Under Network > Switch:
+Delete the vlan 2 (WAN) section in LuCI, and ensure port0/WAN port is assigned to vlan 1 as "untagged".
+NB! Do not disable VLAN functionality. You will lose network connectivity.
+  Save and apply.
+----------------------------
+
+---- Wireless monitoring ----
+Ensure that you have no WiFi clients or any wireless configs on LuCI.
+  In the commandline, (console or SSH):
+    	ip link set mon0 down
+      iw dev mon0 del
+      iw phy phy0 interface add mon0 type monitor
+	    ip link set mon0 up
+
+In this mode, wireless sniffing should work.
+
+---- Wireless injection ----
+You need to provide some internet access, you can connect to a wireless network or configure the unit to get access through Ethernet.
+Does not matter, as long as it has a wireless connection.
+As for packet injection, try to see if it works by installing aircrack-ng:
+  apk update
+  apk install aircrack-ng
+
+Delete the wireless profiles if you connected through wifi for internet access in LuCI and reboot.
+The wifi radio should stay off.
+      iw phy phy0 interface add mon0 type monitor
+	    ip link set mon0 up
+Then, try this:
+      aireplay-ng --test mon0
+
+It should work. If the kernel crashes, then I don't know anymore, I provided a mt76 patch to try and fix this.
+  Here's my log:
+    root@OpenWrt:~# aireplay-ng --test mon0
+    [ 1292.591637] mt76_wmac 10300000.wmac mon0: entered promiscuous mode
+    [ 1292.604020] mt76_wmac 10300000.wmac mon0: entered allmulticast mode
+    10:57:22  Trying broadcast probe requests...
+    10:57:22  Injection is working!
+    10:57:23  Found 3 APs
+  Seems to work OK, then. Yay.
