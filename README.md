@@ -3,13 +3,17 @@ Crude method in transmitting compressed audio over WiFi packet injection and rec
 
 Make sure that you have a WiFi radio/adapter that has Packet injection support, and another radio for monitor mode. (Most wireless radios support monitor mode)  
 
-Decoder: OpenWRT only, but can be modified to compile on Linux.  
-Encoder: Linux only, but can be modified to compile on OpenWRT.  
+Decoder: AMD64 and MIPS.  
+Encoder: AMD64 and MIPS.  
+Radiotap: AMD64 and MIPS.  
+
 
 My idea was, to build a complete system, that runs on a cheap WiFi radio module (OpenWRT, HLK7628 from Hi-Link) with a soundcard and GPIO pin for PTT and transmit/receive audio over the WiFi link, much like a walkie-talkie or HT (radio speak).  
 This project is just a proof-of-concept that I can receive compressed audio and decode it on the device.  
 At this stage, my OpenWRT device crashes on packet injection, so will have to build custom OpenWRT build with patched WiFi driver.  
 
+Seems like CPU usage spikes to about 90% on MIPS when transmitting, but about 70% when receiving. (Single core MIPS device)  
+There may be some audio glitches (timing related?) but YMMV.  
 
 ## Notice
 Please make sure you are able to transmit such WiFi packets arbitrarily. Use this code on your own risk!  
@@ -27,4 +31,9 @@ Uses [RadioTap](https://github.com/radiotap/radiotap-library) from the Radiotap 
 Uses OpenWRT SDK for compiling to mt76x8 OpenWRT device, for receiving data and decoding.  
 
 ## Further notes
-mt76 OpenWRT device crashes on packet injection. May have to manually patch driver and rebuild. [mt76-pktinject](https://github.com/RuhanSA079/mt76-pktinject)
+mt76 OpenWRT device crashes on packet injection.  
+May have to manually patch driver and rebuild. [mt76-pktinject](https://github.com/RuhanSA079/mt76-pktinject)  
+Seems like the patched driver code fixes kernel crash.  
+
+Included build instructions and buildscripts used for compiling on AMD64 and ramips in notes.txt  
+Please use at your own risk.  

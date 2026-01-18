@@ -1,0 +1,71 @@
+
+Build with the following:
+-------------------------
+
+Make project root -> TXApp
+inside TXApp, download openwrt SDK for your target and extract right there in TXApp folder.
+Make a 'app' folder in the TXApp folder.
+Add the source files from git to the app folder.
+Add build.sh from git to app folder.
+Inside app folder, clone both radiotap-library and codec2 git repos inside app folder.
+
+
+Must look like this:
+TXApp
+  - openwrt_sdk_folder
+  - app
+        - radiotap_decode_amd64.c
+        - radiotap_decode_mips.c
+        - radiotap-library
+        - codec2
+        - build.sh
+
+Go inside the app/codec2 folder.
+Add the build_openwrt.sh from git and modify script to suit openwrt sdk directory.
+Add the build_amd64.sh from git.
+Execute script(s).
+
+Modify build.sh script to suit your openwrt_sdk_folder name/version.
+If all goes well, build.sh script should be able to build the applications.
+
+---------------------------------------------------------------------------------------------
+TODO:
+Port libnl-tiny to my build, and set iw config modes to monitor, etc.
+Add code to bring down current phy0 interface (if used for wifi)
+
+
+Codec2 notes:
+-------------------
+Packet header ID: 0xC2 0xC2 0xC2 0xC2
+
+struct codec2data {
+ uint8 channelno; //(0 to 3) -> 0 is broadcast, 1 is channel 1, 2 is channel 2, 3 is channel 3) To be 
+ uint8 ptt; // 0 is end of transmission, 1 is voice transmission
+ [array of codec2 voice data] codec_voice; // keep 0 if ptt is 0, otherwise do voice data(keep to 128 bytes)
+}
+
+So, it will work like this.
+packet header ID + codec2data struct.
+
+Operation:
+----------
+
+Normal operation (User presses button, talks and releases talk button)
+send packet header, channelno is 1, ptt is 1, no data yet. //indicates that user pressed the talk button.
+send packet header, channelno is 1, ptt is 1, voice_data //User talks.
+send packet header, channelno is 1, ptt is 1, voice_data //User talks.
+send packet header, channelno is 1, ptt is 1, voice_data //User talks.
+send packet header, channelno is 1, ptt is 0, no data. //indicates user is finished talking (released the talk button)
+
+Normal operation (User presses button, talks, but then moves out of range)
+send packet header, channelno is 1, ptt is 1, no data yet. //indicates that user pressed the talk button.
+send packet header, channelno is 1, ptt is 1, voice_data //User talks.
+send packet header, channelno is 1, ptt is 1, voice_data //User talks.
+send packet header, channelno is 1, ptt is 1, voice_data //User talks.
+* data receioved no-more *
+system must automatically close audio channel after 300ms.
+
+Decoding (testing only):
+------------------------
+Decode the PCM audio on remote computer:
+nc decoder-device-ip 3443 | aplay -f S16_LE -r 8000 -c 1
