@@ -30,7 +30,7 @@ Please make sure you are able to transmit such WiFi packets arbitrarily. Use thi
 I am not responsible if you transmit random packets on the 2.4Ghz or 5Ghz spectrum. You have been warned.  
 
 Please do not open a issue on why you cannot compile the code or anything like that. Go ask the AI to fix your compiler problems.  
-You may use the code 
+You may use the code as a template or whatever. Go read the license.
 
 ## AI Notice
 Has been vibe-coded heavily, and made some pure C developers turn in their graves with my patchy code, spewing memory leaks and violating coding rules.  
