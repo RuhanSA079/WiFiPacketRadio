@@ -40,7 +40,7 @@ I also had modified a lot of code, since the AI can't really code, more of a the
 ## Notes
 Uses [Codec2](https://github.com/drowe67/codec2) from drowe67, to compress PCM samples to transmit raw bytes over WiFi. Quite impressive. Thanks, mate!  
 Uses [RadioTap](https://github.com/radiotap/radiotap-library) from the Radiotap org, but extended heavily on the debug logs and parser they had.  
-Have been heavily inspired by [WFB-ng](https://github.com/svpcom/wfb-ng) 
+Have been heavily inspired by [WFB-ng](https://github.com/svpcom/wfb-ng)  
 Uses OpenWRT SDK for compiling to mt76x8 OpenWRT device, for receiving data and decoding.  
 
 ## Further notes
