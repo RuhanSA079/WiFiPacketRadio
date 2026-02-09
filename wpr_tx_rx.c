@@ -107,11 +107,12 @@ bool usePcapForRx = false;
 
 static int tcp_listen = 0;
 static double phase = 0.0;
-uint16_t tx_seq = 0;
+uint8_t tx_seq = 0;
 uint64_t last_tx_test_tone = 0;
 struct sockaddr_ll sll;
 static FILE *wavFile = NULL;
 
+uint8_t wpr_hdr[6]; // MAGIC (4 bytes) + ChannelID (1 byte) + PTT mode (1 byte)
 pcap_t *pcap_handle = NULL;
 uint16_t hdr_seq_tx = 0;
 struct radiotap_hdr rtap_tx;
@@ -245,6 +246,14 @@ static void setup_mac_radiotap(void)
     mac_hdr_tx.addr2[0] = 0x57;
     mac_hdr_tx.addr2[1] = 0x42;
     mac_hdr_tx.addr2[5] = 0x01;
+
+    //setup the WiFi Packet Radio header (MAGIC + ChannelID + PTT)
+    wpr_hdr[0] = 0xC2;
+    wpr_hdr[1] = 0xC2;
+    wpr_hdr[2] = 0xC2;
+    wpr_hdr[3] = 0xC2;
+    wpr_hdr[4] = AUDIO_CHANNEL_ID; // Channel ID
+    wpr_hdr[5] = 0;                // PTT mode (0 = off, 1 = on) to be later set during transmission
 }
 
 static void codec2_timeout_check(void)
@@ -444,8 +453,36 @@ static void setup_radio(void)
     }
 }
 
+// CRC-16-CCITT calculation for data integrity checks
+uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int b = 0; b < 8; ++b) {
+            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+            else crc <<= 1;
+        }
+    }
+    return crc;
+}
+
 static uint64_t send_radio_data(const uint8_t *pkt_data, size_t pkt_len)
 {
+
+    // TODO: Use the existing radio frame data (MAGIC, ChannelID, PTT), 
+    // add sequence number, copy Codec2 data, append FEC (forward error correction) bits
+    uint8_t radioDataPayload[(6 + 1 + pkt_len + 2)]; // [MAGIC+ChannelID+PTT] + seq + data + fec bits
+
+    // Copy MAGIC + ChannelID + PTT
+    memcpy(radioDataPayload, wpr_hdr, 6);
+    // Set PTT mode to 1 (on) during transmission
+    radioDataPayload[5] = 1; // PTT mode (0 = off, 1 = on)
+    // Set sequence number
+    radioDataPayload[6] = tx_seq;
+    // Copy Codec2 data
+    memcpy(radioDataPayload + 7, pkt_data, pkt_len);
+
+    //compute FEC bits (uint16t)
 
     if (pkt_len <= 0)
     {
@@ -472,6 +509,8 @@ static uint64_t send_radio_data(const uint8_t *pkt_data, size_t pkt_len)
     len += sizeof(mac_hdr_tx);
     memcpy(frame + len, payload, poff);
     len += poff;
+
+    tx_seq++;
 
     // static unsigned long tx_dbg_cnt = 0;
     // if ((tx_dbg_cnt++ & 0x3F) == 0) {
