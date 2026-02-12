@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include "codec2/src/codec2.h"
+#include "fec.h"
 
 /* ---------------- some constants ---------------- */
 #if defined(__x86_64__) || defined(_M_X64)
@@ -107,7 +108,7 @@ bool usePcapForRx = false;
 
 static int tcp_listen = 0;
 static double phase = 0.0;
-uint8_t tx_seq = 0;
+uint16_t tx_seq = 0;
 uint64_t last_tx_test_tone = 0;
 struct sockaddr_ll sll;
 static FILE *wavFile = NULL;
@@ -118,7 +119,6 @@ uint16_t hdr_seq_tx = 0;
 struct radiotap_hdr rtap_tx;
 struct ieee80211_mac_hdr mac_hdr_tx;
 static struct audio_channel_state channels[4];
-
 
 #define PCM_BYTE_COUNT 160 /* 20 ms of audio at 8 kHz */
 #define PCM_100MS_BYTE_COUNT (PCM_BYTE_COUNT * 5) // enough for 100 ms of audio, 160 bytes per 20 ms frame * 5 = 800 bytes
@@ -453,56 +453,145 @@ static void setup_radio(void)
     }
 }
 
-// CRC-16-CCITT calculation for data integrity checks
-uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int b = 0; b < 8; ++b) {
-            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
-            else crc <<= 1;
-        }
-    }
-    return crc;
-}
-
 static uint64_t send_radio_data(const uint8_t *pkt_data, size_t pkt_len)
 {
-
-    // TODO: Use the existing radio frame data (MAGIC, ChannelID, PTT), 
-    // add sequence number, copy Codec2 data, append FEC (forward error correction) bits
-    uint8_t radioDataPayload[(6 + 1 + pkt_len + 2)]; // [MAGIC+ChannelID+PTT] + seq + data + fec bits
-
-    // Copy MAGIC + ChannelID + PTT
-    memcpy(radioDataPayload, wpr_hdr, 6);
-    // Set PTT mode to 1 (on) during transmission
-    radioDataPayload[5] = 1; // PTT mode (0 = off, 1 = on)
-    // Set sequence number
-    radioDataPayload[6] = tx_seq;
-    // Copy Codec2 data
-    memcpy(radioDataPayload + 7, pkt_data, pkt_len);
-
-    //compute FEC bits (uint16t)
-
-    if (pkt_len <= 0)
-    {
+    if (pkt_len == 0) {
         return 0;
     }
 
-    uint8_t payload[pkt_len];
+    // Use the existing radio frame data (MAGIC, ChannelID, PTT), 
+    // add sequence number, copy Codec2 data, append FEC parity bytes
 
+    int fecParityBytes = 4; // Keep it four for now.
+    int fecDataLen = 6 + 2 + (int)pkt_len; // header (6) + seq (2) + data (pkt_len)
+    int radioPacketLen = fecDataLen + fecParityBytes; // total bytes we will send over radio
+
+    // Build the data that FEC will cover: [MAGIC+ChannelID+PTT] + [seq(2)] + [data]
+    uint8_t *radioDataPayload = (uint8_t *)malloc(radioPacketLen);
+    if (!radioDataPayload) {
+        if (debug) fprintf(stderr, "send_radio_data: malloc failed\n");
+        return (uint64_t)-1;
+    }
+
+    memcpy(radioDataPayload, wpr_hdr, 6);
+    
+    // Set PTT on during transmission if not set
+    radioDataPayload[5] = 1;
+
+    // Set sequence number (big-endian: high byte then low byte)
+    // tx_seq assumed to be a uint16_t or similar available in scope
+    radioDataPayload[6] = (uint8_t)((tx_seq >> 8) & 0xFF);
+    radioDataPayload[7] = (uint8_t)(tx_seq & 0xFF);
+
+    // Copy Codec2 data after the 8-byte header+seq
+    memcpy(radioDataPayload + 8, pkt_data, pkt_len);
+
+    // --- FEC encoding ---
+    // Strategy: treat each byte of radioDataPayload[0..fecDataLen-1] as a "primary packet"
+    // so k = fecDataLen, n = k + fecParityBytes, packet size sz = 1
+    uint16_t k = (uint16_t)fecDataLen;
+    uint16_t n = (uint16_t)(k + fecParityBytes);
+    if (k == 0 || n <= k) {
+        if (debug) fprintf(stderr, "send_radio_data: invalid FEC params k=%u n=%u\n", k, n);
+        free(radioDataPayload);
+        return (uint64_t)-1;
+    }
+
+    fec_t *fec = fec_new(k, n);
+    if (!fec) {
+        if (debug) fprintf(stderr, "send_radio_data: fec_new failed\n");
+        free(radioDataPayload);
+        return (uint64_t)-1;
+    }
+
+    // Prepare src pointers: each points to one byte (packet size = 1)
+    // NOTE: the FEC API expects arrays of gf*; gf is typically a byte type.
+    const unsigned src_count = k;
+    gf **src = (gf **)malloc(sizeof(gf*) * src_count);
+    if (!src) {
+        if (debug) fprintf(stderr, "send_radio_data: malloc src failed\n");
+        fec_free(fec);
+        free(radioDataPayload);
+        return (uint64_t)-1;
+    }
+    for (unsigned i = 0; i < src_count; ++i) {
+        // point to each byte in radioDataPayload
+        src[i] = (gf *)(radioDataPayload + i);
+    }
+
+    // Prepare fec output buffers: each parity block is of size 1 (sz = 1)
+    gf **fecs = (gf **)malloc(sizeof(gf*) * fecParityBytes);
+    if (!fecs) {
+        if (debug) fprintf(stderr, "send_radio_data: malloc fecs failed\n");
+        free(src);
+        fec_free(fec);
+        free(radioDataPayload);
+        return (uint64_t)-1;
+    }
+    for (int i = 0; i < fecParityBytes; ++i) {
+        fecs[i] = (gf *)malloc(1); // one byte per parity block
+        if (!fecs[i]) {
+            if (debug) fprintf(stderr, "send_radio_data: malloc fecs[%d] failed\n", i);
+            for (int j = 0; j < i; ++j) free(fecs[j]);
+            free(fecs);
+            free(src);
+            fec_free(fec);
+            free(radioDataPayload);
+            return (uint64_t)-1;
+        }
+    }
+
+    // Call fec_encode: src has k pointers to 1-byte packets, fecs will receive fecParityBytes parity bytes
+    // cast to match prototype: fec_encode(const fec_t*, const gf**, gf**, size_t sz)
+    fec_encode(fec, (const gf**)src, fecs, 1);
+
+    // Append the parity bytes to the radioDataPayload end
+    for (int i = 0; i < fecParityBytes; ++i) {
+        radioDataPayload[fecDataLen + i] = (uint8_t)(fecs[i][0]);
+    }
+
+    // Clean up FEC temporaries
+    for (int i = 0; i < fecParityBytes; ++i) {
+        free(fecs[i]);
+    }
+    free(fecs);
+    free(src);
+    fec_free(fec);
+    // --- end FEC encoding ---
+
+    // Now create the payload used by the MAC/radio transmit path
+    // We keep your existing payload/rtap/mac_hdr flow; copy radioDataPayload (which now includes parity)
     size_t poff = 0;
-    memcpy(payload + poff, pkt_data, pkt_len);
-    poff += pkt_len;
+    // payload holds only the codec/data+parity portion in your original design; 
+    // adapt to copy the radioDataPayload body (seq+data+parity) as you need for your frame
+    // In your original code you then used mac_hdr_tx.seq and rtap_tx etc.
+    // Here I'll place the full radioDataPayload into the payload portion that you later append into frame.
+
+    size_t body_len = (size_t)radioPacketLen; // seq+data+parity + initial 6 header bytes
+    uint8_t *payload = (uint8_t *)malloc(body_len);
+    if (!payload) {
+        if (debug) fprintf(stderr, "send_radio_data: malloc payload failed\n");
+        free(radioDataPayload);
+        return (uint64_t)-1;
+    }
+    memcpy(payload, radioDataPayload, body_len);
+    poff = body_len;
+
+    free(radioDataPayload);
 
     // Advance hdr sequence
     mac_hdr_tx.seq = htole16(hdr_seq_tx++ << 4);
 
     // Calculate exactly how big the frame must be.
-    int frameSize = (sizeof(rtap_tx) + sizeof(mac_hdr_tx) + poff);
-    uint8_t frame[frameSize];
-    size_t len = 0;
+    int frameSize = (int)(sizeof(rtap_tx) + sizeof(mac_hdr_tx) + poff);
+    uint8_t *frame = (uint8_t *)malloc(frameSize);
+    if (!frame) {
+        if (debug) fprintf(stderr, "send_radio_data: malloc frame failed\n");
+        free(payload);
+        return (uint64_t)-1;
+    }
 
+    size_t len = 0;
     memcpy(frame + len, &rtap_tx, sizeof(rtap_tx));
     len += sizeof(rtap_tx);
     memcpy(frame + len, &mac_hdr_tx, sizeof(mac_hdr_tx));
@@ -510,110 +599,163 @@ static uint64_t send_radio_data(const uint8_t *pkt_data, size_t pkt_len)
     memcpy(frame + len, payload, poff);
     len += poff;
 
-    tx_seq++;
+    free(payload);
 
-    // static unsigned long tx_dbg_cnt = 0;
-    // if ((tx_dbg_cnt++ & 0x3F) == 0) {
-    //     fprintf(stderr, "TX frame_len=%zu payload_len=%zu body_first_bytes:", len, poff);
-    //     size_t body_offset = sizeof(rtap_tx) + sizeof(mac_hdr_tx);
-    //     size_t dump_n = poff < 12 ? poff : 12;
-    //     for (size_t i = 0; i < dump_n; ++i) {
-    //         fprintf(stderr, " %02x", frame[body_offset + i]);
-    //     }
-    //     fprintf(stderr, "\n");
-    // }
+    // increment tx_seq for next radio seq
+    tx_seq++;
 
     if (radio_fd < 0)
     {
         if (debug)
             fprintf(stderr, "send_radio_data: radio_fd not open, aborting send\n");
+        free(frame);
         return (uint64_t)-1;
     }
 
     ssize_t sret = sendto(radio_fd, frame, len, 0, (struct sockaddr *)&sll, sizeof(sll));
     if (sret < 0)
     {
-        if (debug)
-        {
+        if (debug) {
             fprintf(stderr, "send_radio_data: sendto returned %zd, aborting send\n", sret);
         }
+        free(frame);
         return (uint64_t)-1;
     }
 
+    free(frame);
     return 0;
 }
 
-// TODO: Add "buffering" to handle latency jitter, e.g. store several frames and write them out at a steady rate.
+
 static void decode_codec2_voice_data(const uint8_t *voice, size_t voice_len)
 {
-    if (!codec2)
-    {
+    if (!codec2) {
         fprintf(stderr, "Codec2 invalid!\n");
         return;
     }
 
-    ssize_t expected = codec2_bytes_per_frame(codec2);   /* e.g. 6 or 8 */
-    ssize_t nsamples = codec2_samples_per_frame(codec2); /* e.g. 160 */
+    ssize_t expected = codec2_bytes_per_frame(codec2);
+    ssize_t nsamples = codec2_samples_per_frame(codec2);
     size_t pcm_bytes = (size_t)nsamples * sizeof(int16_t);
 
-    /* Quick sanity: no payload */
     if (voice_len == 0)
         return;
 
-    /* If payload exactly matches codec2 compressed size -> decode */
-    if ((ssize_t)voice_len == expected)
-    {
-        int16_t pcm[nsamples];
-        codec2_decode(codec2, pcm, voice);
+    const int fecParityBytes = 4;   // MUST match encoder
+
+    /* Must at least contain seq (2) + codec2 data */
+    if (voice_len < (size_t)(2 + expected)) {
+        fprintf(stderr, "decode: too short voice_len=%zu\n", voice_len);
+        return;
+    }
+
+    int primary_len = 2 + expected;          // seq + codec2
+    int present_parity = (int)voice_len - primary_len;
+    if (present_parity < 0)
+        present_parity = 0;
+    if (present_parity > fecParityBytes)
+        present_parity = fecParityBytes;
+
+    /* FEC parameters */
+    uint16_t k = (uint16_t)primary_len;
+    uint16_t n = (uint16_t)(k + fecParityBytes);
+
+    fec_t *fec = fec_new(k, n);
+    if (!fec) {
+        fprintf(stderr, "decode: fec_new failed\n");
+        return;
+    }
+
+    int present_primary = primary_len;
+    int present_count = present_primary + present_parity;
+
+    /* Allocate arrays */
+    const gf **inpkts = (const gf **)malloc(sizeof(gf*) * present_count);
+    unsigned *index = (unsigned *)malloc(sizeof(unsigned) * present_count);
+    gf **outpkts = (gf **)calloc(k, sizeof(gf*));
+
+    if (!inpkts || !index || !outpkts) {
+        fprintf(stderr, "decode: malloc failed\n");
+        free(inpkts);
+        free(index);
+        free(outpkts);
+        fec_free(fec);
+        return;
+    }
+
+    /* Present primary blocks (seq + codec2) */
+    int cursor = 0;
+    for (int i = 0; i < present_primary; ++i) {
+        inpkts[cursor] = (const gf *)(voice + i);
+        index[cursor] = (unsigned)i;
+        cursor++;
+    }
+
+    /* Present parity blocks */
+    const uint8_t *parity_base = voice + primary_len;
+    for (int p = 0; p < present_parity; ++p) {
+        inpkts[cursor] = (const gf *)(parity_base + p);
+        index[cursor] = (unsigned)k + p;
+        cursor++;
+    }
+
+    /* Allocate buffers for any primary that might need reconstruction */
+    for (unsigned i = 0; i < k; ++i) {
+        outpkts[i] = (gf *)malloc(1);
+        if (!outpkts[i]) {
+            fprintf(stderr, "decode: malloc outpkts failed\n");
+            for (unsigned j = 0; j < i; ++j)
+                free(outpkts[j]);
+            free(outpkts);
+            free(inpkts);
+            free(index);
+            fec_free(fec);
+            return;
+        }
+    }
+
+    /* Prepare pcm buffer here so that no goto jumps into its scope later */
+    int16_t pcm_arr[ /* VLA */ nsamples ];
+    int16_t *pcm = pcm_arr;
+
+    /* Perform FEC correction */
+    fec_decode(fec, inpkts, outpkts, index, 1);
+
+    /* Build corrected primary buffer */
+    uint8_t *corrected = (uint8_t *)malloc(k);
+    if (!corrected) {
+        fprintf(stderr, "decode: malloc corrected failed\n");
+        goto final_cleanup;
+    }
+
+    for (unsigned i = 0; i < k; ++i) {
+        corrected[i] = (uint8_t)outpkts[i][0];
+    }
+
+    /* Extract corrected codec2 bytes */
+    uint8_t *codec2_bytes = corrected + 2;
+
+    /* Now — and only now — decode codec2 */
+    codec2_decode(codec2, pcm, codec2_bytes);
+
+    if (audio_out_fd > 0) {
         ssize_t w = write(audio_out_fd, pcm, pcm_bytes);
-        (void)w;
-
-        return;
+        if (w < 0) perror("write audio");
+        else if ((size_t)w != pcm_bytes) fprintf(stderr, "Short audio write (%zd/%zu)\n", w, pcm_bytes);
     }
 
-    /* If payload is larger than expected codec bytes but not full PCM:
-       attempt to decode first `expected` bytes and log the rest for diagnosis. */
-    if ((ssize_t)voice_len >= expected)
-    {
-        if (voice_len != (size_t)expected)
-        {
-            /* Log first bytes to help identify format (only first 16 bytes to avoid huge prints) */
-            int dump_n = (voice_len < 16 ? (int)voice_len : 16);
+    free(corrected);
 
-            fprintf(stderr, "decode: payload len=%zu (expected %zd). first %d bytes:", voice_len, expected, dump_n);
-            for (int i = 0; i < dump_n; ++i)
-            {
-                fprintf(stderr, " %02x", voice[i]);
-            }
-            fprintf(stderr, "\n");
-        }
-
-        /* Try to decode the first 'expected' bytes */
-        int16_t pcm[nsamples];
-        codec2_decode(codec2, pcm, voice); /* use first expected bytes */
-
-        if (audio_out_fd > 0) {
-            ssize_t w = write(audio_out_fd, pcm, nsamples * sizeof(int16_t));
-            if (w < 0) {
-                perror("write audio");
-            } else if ((size_t)w != nsamples * sizeof(int16_t)) {
-                printf("Short audio write (%zd/%zu)\n", w, nsamples * sizeof(int16_t));
-            }
-        }
-
-        return;
+final_cleanup:
+    for (unsigned i = 0; i < k; ++i) {
+        free(outpkts[i]);
     }
-
-    /* If payload is shorter than expected compressed bytes -> log and ignore */
-    fprintf(stderr, "decode: frame too small (%zu bytes, expected %zd). Dumping bytes:", voice_len, expected);
-    int dump_n = (voice_len < 16 ? (int)voice_len : 16);
-    for (int i = 0; i < dump_n; ++i)
-    {
-        fprintf(stderr, " %02x", voice[i]);
-    }
-
-    fprintf(stderr, "\n");
+    free(outpkts);
+    free(inpkts);
+    free(index);
+    fec_free(fec);
 }
+
 
 static void parse_radiotap_header(const uint8_t *pkt, size_t len, const struct pcap_pkthdr *pcaphdr)
 {
@@ -863,8 +1005,8 @@ static void parse_radiotap_header(const uint8_t *pkt, size_t len, const struct p
             return;
         }
 
-        /* decode only expected bytes; ignore any trailing bytes */
-        decode_codec2_voice_data(audio_ptr, expected_audio_len);
+        
+        decode_codec2_voice_data(audio_ptr, audio_len);
     }
     else
     {

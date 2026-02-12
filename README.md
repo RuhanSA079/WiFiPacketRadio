@@ -22,7 +22,7 @@ front of the convoy transmits, the middle vehicle receives it, and relays it bac
 - Implement selective private comms by radio ID or MAC, say, between vehicle 1 and 3, without vehicle 2 hearing the conversation.  
 
 ## Very nice to do
-- Port this code-base and driver code to something like Circle, running baremetal C++ code: https://github.com/rsta2/circle
+- Port this code-base and wireless driver code to something like Circle, running baremetal C++ code: https://github.com/rsta2/circle
 
 ## Notice
 Please make sure you are able to transmit such WiFi packets arbitrarily. Use this code on your own risk!  
@@ -40,8 +40,10 @@ I also had modified a lot of code, since the AI can't really code, more of a the
 ## Notes
 Uses [Codec2](https://github.com/drowe67/codec2) from drowe67, to compress PCM samples to transmit raw bytes over WiFi. Quite impressive. Thanks, mate!  
 Uses [RadioTap](https://github.com/radiotap/radiotap-library) from the Radiotap org, but extended heavily on the debug logs and parser they had.  
-Have been heavily inspired by [WFB-ng](https://github.com/svpcom/wfb-ng)  
-Uses OpenWRT SDK for compiling to mt76x8 OpenWRT device, for receiving data and decoding.  
+Heavily inspired by [WFB-ng](https://github.com/svpcom/wfb-ng)  
+Uses zfec by tahoe-lafs [zfec](https://tahoe-lafs.org/trac/zfec/)  
+Uses GStreamer libs for the potential audio/packet jitter caused by delayed receives  
+
 
 ## Further notes
 Seems like CPU usage spikes to about 90% on MIPS when transmitting, but about 70% when receiving.  
