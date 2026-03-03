@@ -5,11 +5,11 @@
  Please check with your country's radio licensing spectrum and power limits, as per regulatory domain.
  This program is developed as a proof-of-concept, as a experimental means to see how far 2.4 Ghz and 5Ghz radio packets being transmitted, can be received reliably.
  The author intends to use a higher power wireless radio (1 watt/30dBm) on 5Ghz, nothing more, to experiment with the range of radio packets TXed and RXed
- 
+
 
  The mt76 target is considered deprecated, as the stringent "clocking" requirements are too strict, and "stutters" the audio, and driver overheads causing timing issues. (transmit)
  The author intends to test this WiFiPacketRadio experiment on a AMD64 laptop, and a Raspberry Pi Zero 2W or Raspberry Pi CM4 as client devices, with a patched RTL8812AU/EU driver.
- 
+
  The experiment will determine the following:
  - Which frequency works best for the longest distance (2.4 GHz vs 5 GHz)
  - Which frequency is best used when doing Line-of-sight (LOS) or in "urban" areas or in the "field" (trees/foliage).
@@ -48,10 +48,10 @@
 #include "fec.h"
 #include "ringbuffer.h"
 
-//on Raspberry-Pi
+// on Raspberry-Pi
 #if defined(__x86_64__) || defined(_M_X64)
-#define RADIO_IFACE "wlx08beac033ffd"
-#else 
+#define RADIO_IFACE "wlan0"
+#else
 #define RADIO_IFACE "wlan1"
 #endif
 
@@ -72,27 +72,28 @@
 #define FC_TO_DS(fc) ((fc) & 0x0100)
 #define FC_FROM_DS(fc) ((fc) & 0x0200)
 
-//RadioTap message seems to work like this:
-// Radiotap_hdr -> header data defining the radio's settings, rates, enable/disable certain features, etc.
-// ieee80211_mac_hdr -> Header data that contains the data frame stuff, duration and then the three MAC addresses, as well as the frame sequence number.
-// Raw data -- My raw data that I send (c2c2c2c2 + channel data + audio data, etc.)
+// RadioTap message seems to work like this:
+//  Radiotap_hdr -> header data defining the radio's settings, rates, enable/disable certain features, etc.
+//  ieee80211_mac_hdr -> Header data that contains the data frame stuff, duration and then the three MAC addresses, as well as the frame sequence number.
+//  Raw data -- My raw data that I send (c2c2c2c2 + channel data + audio data, etc.)
 
 #define RADIO_DATA_NOOP 0x00
 #define RADIO_DATA_AUDIO 0x01
 #define RADIO_DATA_MESH 0x02
-
-//Stock standard radio struct:
-// Magic header
-// Data type
-// Data
-// FEC data
+#define MCS_VALUES (IEEE80211_RADIOTAP_MCS_HAVE_MCS | IEEE80211_RADIOTAP_MCS_HAVE_BW | IEEE80211_RADIOTAP_MCS_HAVE_GI | IEEE80211_RADIOTAP_MCS_HAVE_STBC | IEEE80211_RADIOTAP_MCS_HAVE_FEC)
+#define IEEE80211_FTYPE_DATA 0x0008
+// Stock standard radio struct:
+//  Magic header
+//  Data type
+//  Data
+//  FEC data
 
 // Types of data:
 // 1. Audio data
 // 2. Mesh data (contains no audio data)
 
 // Max data length that will be sent:
-// 1. Audio data -> 
+// 1. Audio data ->
 //      channel ID -> 1 byte
 //      ptt_mode -> 1 byte
 //      Codec2 data -> 8 bytes
@@ -105,8 +106,8 @@
 // FEC data
 //      4 bytes or 6?
 
-//From this, it derived that the maximum amount of "data" we can send, is 16 bytes, max. 
-//Can be adjusted later in the struct
+// From this, it derived that the maximum amount of "data" we can send, is 16 bytes, max.
+// Can be adjusted later in the struct
 
 struct wpr_data
 {
@@ -114,7 +115,7 @@ struct wpr_data
     uint8_t data_type;
     uint8_t data[16];
     uint8_t fec[6];
-} __attribute__((packed));;
+} __attribute__((packed));
 
 // Stock-standard 802.11 headers
 struct ieee80211_mac_hdr
@@ -127,9 +128,19 @@ struct ieee80211_mac_hdr
     uint16_t seq;
 } __attribute__((packed));
 
+struct radiotap_hdr_data
+{
+    uint8_t rt_flags;
+    uint16_t tx_flags;
+    uint8_t mcs_known;
+    uint8_t mcs_flags;
+    uint8_t mcs;
+};
+
 struct radiotap_hdr
 {
     struct ieee80211_radiotap_header rt;
+    struct radiotap_hdr_data rtd;
     struct ieee80211_mac_hdr mh;
     struct wpr_data wpr;
 } __attribute__((packed));
@@ -154,12 +165,12 @@ unsigned char *hwMAC;          // Hardware MAC address of the radio interface, u
 unsigned char macBroadcast[6]; // Broadcast MAC address for filtering incoming packets (set to ff:ff:ff:ff:ff:ff).
 int radio_fd, pcap_fd, audio_in_fd, audio_out_fd = 0;
 
-bool debug = true;
-bool debugRadioData = true;
+bool debug = false;
+bool debugRadioData = false;
 volatile sig_atomic_t running = 1;
 bool isRadioReceiving = false;
 bool isRadioTransmitting = false;
-bool usePcapForRx = false;
+bool useQDiscBypass = true;
 
 static int tcp_listen = 0;
 static double phase = 0.0;
@@ -172,9 +183,12 @@ pcap_t *pcap_handle = NULL;
 
 uint16_t hdr_seq_tx = 0;
 
+uint8_t mcs_flags = 0;
+
 struct wpr_data wpr_data_rx;
 struct wpr_data wpr_data_tx;
 struct ieee80211_mac_hdr mac_hdr_tx;
+struct radiotap_hdr_data rtap_hdr_data_tx;
 struct radiotap_hdr rtap_tx;
 
 static struct audio_channel_state channels[4];
@@ -240,6 +254,8 @@ static void cleanup(void)
         codec2_destroy(codec2);
         codec2 = NULL;
     }
+
+    exit(0);
 }
 
 static void sigint(int sig)
@@ -265,7 +281,6 @@ static void run_cmd(const char *cmd)
     {
         fprintf(stderr, "Command failed: %s\n", cmd);
         cleanup();
-        exit(1);
     }
 }
 
@@ -277,20 +292,21 @@ static void setup_radio_monitor(void)
     // Bring down monitor interface
     run_cmd("ip link set " RADIO_IFACE " down 2>/dev/null || true");
 
-    // reconfigure radio...
-    #if defined(__x86_64__) || defined(_M_X64)
+// reconfigure radio...
+#if defined(__x86_64__) || defined(_M_X64)
     run_cmd("iw dev " RADIO_IFACE " set monitor otherbss");
-    #else
+    run_cmd("iwconfig " RADIO_IFACE " channel 36");
+#else
     run_cmd("iw reg set BO");
     run_cmd("iw dev " RADIO_IFACE " set monitor otherbss");
-    run_cmd("iwconfig " RADIO_IFACE " channel 1");
-    #endif
+    run_cmd("iwconfig " RADIO_IFACE " channel 36");
+#endif
 
-    //Leave txpower for now
-    //run_cmd("iw dev " RADIO_IFACE " set txpower fixed 3000"); //powaaa
-    //Do HT or VHT (high throughput or Very High Throughput), leave disabled for now
-    //Radio is default on 20Mhz bw, which is fine.
-    
+    // Leave txpower for now
+    run_cmd("iw dev " RADIO_IFACE " set txpower fixed 300"); // powaaa
+    // Do HT or VHT (high throughput or Very High Throughput), leave disabled for now
+    // Radio is default on 20Mhz bw, which is fine.
+
     run_cmd("ip link set " RADIO_IFACE " up");
 }
 
@@ -298,19 +314,35 @@ static void setup_mac_radiotap(void)
 {
     if (debug)
     {
-        printf("setup_mac_radiotap...");
+        printf("setup_mac_radiotap...\n");
     }
 
-    memset(&rtap_tx, 0, sizeof(rtap_tx)); //Zero-out the radiotap header.
+    memset(&rtap_tx, 0, sizeof(rtap_tx)); // Zero-out the radiotap header.
+
+    // 20 Mhz, no GI, STBC 1, LDPC enabled
+    mcs_flags |= IEEE80211_RADIOTAP_MCS_BW_20;
+    mcs_flags |= (IEEE80211_RADIOTAP_MCS_STBC_1 << IEEE80211_RADIOTAP_MCS_STBC_SHIFT);
+    mcs_flags |= IEEE80211_RADIOTAP_MCS_FEC_LDPC;
+
+    rtap_hdr_data_tx.tx_flags = IEEE80211_RADIOTAP_F_TX_NOACK;
+    rtap_hdr_data_tx.mcs = 1;                // MCS 1
+    rtap_hdr_data_tx.mcs_flags = mcs_flags;  // See above
+    rtap_hdr_data_tx.mcs_known = MCS_VALUES; //
+
+    // Set radiotap flags to disable FCS (for now, needs to enable it soon)
+    rtap_hdr_data_tx.rt_flags = 0;
 
     rtap_tx.rt.it_version = 0;
-    rtap_tx.rt.it_present = htole32((1u << IEEE80211_RADIOTAP_TX_FLAGS) | (1u << IEEE80211_RADIOTAP_MCS));
-    rtap_tx.rt.it_len = htole16(sizeof(rtap_tx));
+    rtap_tx.rt.it_present = htole32(1u << IEEE80211_RADIOTAP_FLAGS | 1u << IEEE80211_RADIOTAP_TX_FLAGS | 1u << IEEE80211_RADIOTAP_MCS);
+    rtap_tx.rt.it_len = htole16((sizeof(rtap_tx.rt) + sizeof(rtap_hdr_data_tx))); // Extremely important to define the whole radiotap header size and radiotap "data" that follows the header, before the 802.11 MAC stuff
+
+    // Set the radiotap message data already to the whole "message" that needs to be sent...
+    rtap_tx.rtd = rtap_hdr_data_tx;
 
     // Setup MAC headers for the WPR data stuff
-    mac_hdr_tx.fc = htole16(0x0801);   /* data frame */
-    mac_hdr_tx.dur = htole16(0x0000);   /* duration */
-    memset(mac_hdr_tx.addr1, 0xff, 6); /* broadcast */
+    mac_hdr_tx.fc = htole16(IEEE80211_FTYPE_DATA); /* data frame */
+    mac_hdr_tx.dur = 0x0000;                       /* duration */
+    memset(mac_hdr_tx.addr1, 0xff, 6);             /* broadcast */
     memset(macBroadcast, 0xff, 6);
 
     memset(mac_hdr_tx.addr2, 0x00, 6);
@@ -321,14 +353,14 @@ static void setup_mac_radiotap(void)
     mac_hdr_tx.addr2[1] = 0x42;
     mac_hdr_tx.addr2[5] = 0x01;
 
-    //Set up the wpr_data struct
+    // Set up the wpr_data struct
     wpr_data_tx.magic_header = DATA_HDR_MAGIC;
     wpr_data_tx.data_type = RADIO_DATA_NOOP;
 
     memset(wpr_data_tx.data, 0x00, sizeof(wpr_data_tx.data));
 
     wpr_data_tx.data[0] = AUDIO_CHANNEL_ID;
-    wpr_data_tx.data[1] = 0; //PTT is OFF.
+    wpr_data_tx.data[1] = 0; // PTT is OFF.
 
     memset(wpr_data_tx.fec, 0x00, sizeof(wpr_data_tx.fec));
 }
@@ -349,11 +381,16 @@ static void codec2_timeout_check(void)
 
 static void setup_codec2(void)
 {
+    if (debug)
+    {
+        printf("Setting up Codec2 enc/dec on mode 3200...\n");
+    }
+
     codec2 = codec2_create(CODEC2_MODE_3200);
     if (codec2 == NULL)
     {
         fprintf(stderr, "Failed to create Codec2 instance\n");
-        exit(1);
+        cleanup();
     }
 }
 
@@ -363,21 +400,31 @@ static void setup_radio(void)
     setup_mac_radiotap();
 
     if (debug)
+    {
         printf("Opening radio socket...\n");
+    }
 
-    radio_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    radio_fd = socket(PF_PACKET, SOCK_RAW, 0);
     if (radio_fd < 0)
     {
         perror("socket");
         cleanup();
-        exit(1);
     }
 
-    // int f = fcntl(radio_fd, F_GETFL, 0);
-    // if (f >= 0)
-    // {
-    //     fcntl(radio_fd, F_SETFL, f | O_NONBLOCK);
-    // }
+    if (useQDiscBypass)
+    {
+        if (debug)
+        {
+            printf("Setting up PACKET_QDISC_BYPASS...\n");
+        }
+
+        const int optval = 1;
+        if (setsockopt(radio_fd, SOL_PACKET, PACKET_QDISC_BYPASS, (const void *)&optval, sizeof(optval)) != 0)
+        {
+            printf("Unable to bypass PACKET_QDISC_BYPASS");
+            cleanup();
+        }
+    }
 
     struct ifreq ifr = {0};
     strncpy(ifr.ifr_name, RADIO_IFACE, IF_NAMESIZE - 1);
@@ -386,7 +433,6 @@ static void setup_radio(void)
     {
         perror("SIOCGIFINDEX");
         cleanup();
-        exit(1);
     }
 
     // Save if_index and get mac address
@@ -397,13 +443,14 @@ static void setup_radio(void)
     {
         perror("SIOCGIFHWADDR");
         cleanup();
-        exit(1);
     }
 
     hwMAC = (unsigned char *)ifr.ifr_hwaddr.sa_data;
 
     if (debug)
+    {
         printf("Radio MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n", hwMAC[0], hwMAC[1], hwMAC[2], hwMAC[3], hwMAC[4], hwMAC[5]);
+    }
 
     // set the radio's MAC address in addr3
     memcpy(mac_hdr_tx.addr3, hwMAC, sizeof(mac_hdr_tx.addr3));
@@ -411,9 +458,21 @@ static void setup_radio(void)
     struct sockaddr_ll sll_radio = {
         .sll_family = AF_PACKET,
         .sll_ifindex = ifindex,
-        .sll_protocol = htons(ETH_P_ALL),
+        .sll_protocol = 0,
     };
     sll = sll_radio;
+
+    if (debug)
+    {
+        printf("Binding to radio_fd...\n");
+    }
+
+    if (bind(radio_fd, (struct sockaddr *)&sll, sizeof(sll)) < 0)
+    {
+        close(radio_fd);
+        printf("Unable to bind to radio interface!");
+        cleanup();
+    }
 
     if (isRadioReceiving)
     {
@@ -512,7 +571,7 @@ static void setup_radio(void)
             if (setsockopt(radio_fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)) < 0)
             {
                 perror("PACKET_RX_RING");
-                exit(1);
+                cleanup();
             }
 
             ring_size = req.tp_block_size * req.tp_block_nr;
@@ -523,7 +582,7 @@ static void setup_radio(void)
             if (ring == MAP_FAILED)
             {
                 perror("mmap");
-                exit(1);
+                cleanup();
             }
         }
     }
@@ -536,7 +595,7 @@ static uint64_t send_radio_data(struct wpr_data *pkt_data, size_t pkt_len)
         return 0;
     }
 
-    //TODO: Maybe implement FEC stuff here?
+    // TODO: Maybe implement FEC stuff here?
 
     // Advance mac data header transmit sequence number
     mac_hdr_tx.seq = htole16(hdr_seq_tx++ << 4);
@@ -544,50 +603,60 @@ static uint64_t send_radio_data(struct wpr_data *pkt_data, size_t pkt_len)
     uint8_t *frameDataTX = (uint8_t *)malloc(sizeof(rtap_tx));
     if (!frameDataTX)
     {
-        if (debug)
-            fprintf(stderr, "send_radio_data: malloc frame failed\n");
+        fprintf(stderr, "send_radio_data: malloc frame failed\n");
         return (uint64_t)-1;
     }
 
     rtap_tx.mh = mac_hdr_tx;
-    memcpy(&rtap_tx.wpr, pkt_data, sizeof(rtap_tx.wpr)); //can sizeof(struct wpr_data) also work?
+    memcpy(&rtap_tx.wpr, pkt_data, sizeof(rtap_tx.wpr));
 
-    //Copy all the data from the rtap_tx struct into a usable char array to send data...
     size_t len = 0;
     memcpy(frameDataTX, &rtap_tx, sizeof(rtap_tx));
     len += sizeof(rtap_tx);
 
+    struct iovec iov;
+    iov.iov_base = (void *)frameDataTX;
+    iov.iov_len = len;
+
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = NULL;
+    msg.msg_namelen = 0;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = NULL;
+    msg.msg_controllen = 0;
+    msg.msg_flags = 0;
 
     if (radio_fd < 0)
     {
-        if (debug)
-            fprintf(stderr, "send_radio_data: radio_fd not open, aborting send\n");
+        printf(stderr, "send_radio_data: radio_fd not open, aborting send\n");
         free(frameDataTX);
         return (uint64_t)-1;
     }
+
+    if (debugRadioData)
+    {
         static int dbg_cnt = 0;
         if ((dbg_cnt++ & 0x3F) == 0)
         {
-            fprintf(stderr, "TX: radiopacket payload_len=%lu data:", len);
+            fprintf(stderr, "send_radio_data: payload_len=%lu data:", len);
             for (size_t i = 0; i < len; ++i)
                 fprintf(stderr, " %02x", frameDataTX[i]);
             fprintf(stderr, "\n");
         }
+    }
 
-    ssize_t sret = sendto(radio_fd, frameDataTX, len, 0, (struct sockaddr *)&sll, sizeof(sll));
+    // ssize_t sret = sendto(radio_fd, frameDataTX, len, 0, (struct sockaddr *)&sll, sizeof(sll));
+    ssize_t sret = sendmsg(radio_fd, &msg, 0);
+    // ssize_t sret = write(radio_fd, frameDataTX, len);
     if (sret < 0)
     {
-        if (debug)
-        {
-            fprintf(stderr, "send_radio_data: sendto returned %zd, aborting send\n", sret);
-        }
-        free(frameDataTX);
-        return (uint64_t)-1;
+        fprintf(stderr, "send_radio_data: sendto returned %zd, aborting send\n", sret);
     }
-    printf("Radio sent frame bytes: %lu\n", sret);
 
     free(frameDataTX);
-    return 0;
+    return sret;
 }
 
 static void decode_codec2_voice_data(const uint8_t *voice, size_t voice_len)
@@ -598,13 +667,13 @@ static void decode_codec2_voice_data(const uint8_t *voice, size_t voice_len)
         return;
     }
 
-    ssize_t nsamples = codec2_samples_per_frame(codec2); //For CODEC2_MODE_3200, it is 160 samples.
+    ssize_t nsamples = codec2_samples_per_frame(codec2); // For CODEC2_MODE_3200, it is 160 samples.
     size_t pcm_bytes = (size_t)nsamples * sizeof(int16_t);
 
     if (voice_len == 0)
         return;
 
-    //Prepare the PCM buffer...
+    // Prepare the PCM buffer...
     int16_t pcm_arr[nsamples];
     int16_t *pcm = pcm_arr;
 
@@ -620,102 +689,122 @@ static void decode_codec2_voice_data(const uint8_t *voice, size_t voice_len)
     }
 }
 
-//Decode the message further
 static void process_wpr_data_rx()
 {
     uint8_t data_type = wpr_data_rx.data_type;
-    
-    //TODO: Implement FEC stuff
 
-    switch (data_type){
-        case RADIO_DATA_NOOP:
-            return;
-            break;
-        case RADIO_DATA_AUDIO:
-            goto process_wpr_audio;
-            break;
-        case RADIO_DATA_MESH:
-            printf("RADIO_DATA_MESH message not implemented yet.\n");
-            return;
-            break;
-        default:
-            return;
-            break;
+    // TODO: Implement FEC stuff
+
+    switch (data_type)
+    {
+    case RADIO_DATA_NOOP:
+        return;
+        break;
+    case RADIO_DATA_AUDIO:
+        goto process_wpr_audio;
+        break;
+    case RADIO_DATA_MESH:
+        printf("RADIO_DATA_MESH message not implemented yet.\n");
+        return;
+        break;
+    default:
+        return;
+        break;
     }
 
-    process_wpr_audio:
-        uint8_t channel = wpr_data_rx.data[0];
-        uint8_t pttMode = wpr_data_rx.data[1];
+process_wpr_audio:
+    uint8_t channel = wpr_data_rx.data[0];
+    uint8_t pttMode = wpr_data_rx.data[1];
 
-        if (channel > 3){
-            printf("Unknown channel ID: %u", channel);
-            return;
-        }
+    if (channel > 3)
+    {
+        printf("Unknown channel ID: %u", channel);
+        return;
+    }
 
-        if (channel == AUDIO_CHANNEL_ID){
-            struct audio_channel_state *ch = &channels[channel];
-            size_t audio_len = (size_t)codec2_bytes_per_frame(codec2);
+    if (channel == AUDIO_CHANNEL_ID)
+    {
+        struct audio_channel_state *ch = &channels[channel];
+        size_t audio_len = (size_t)codec2_bytes_per_frame(codec2);
 
-            if (pttMode){
-                if (audio_len > (sizeof(wpr_data_rx.data) - 2)){
-                    printf("Audio data missing!\n");
-                    return;
-                }
-
-                if (!ch->active)
-                {
-                    printf("Channel %u: PTT start\n", channel);
-                    ch->active = 1;
-                }
-                ch->last_rx_ns = now_ns();
-                
-                uint8_t *audio_ptr = (uint8_t *)malloc(audio_len);
-                memcpy(audio_ptr, wpr_data_rx.data + 2, audio_len);
-                decode_codec2_voice_data(audio_ptr, audio_len);
-                free(audio_ptr);
-            }else{
-                if (ch->active)
-                {
-                    printf("Channel %u: PTT end\n", channel);
-                    ch->active = 0;
-                }
+        if (pttMode)
+        {
+            if (audio_len > (sizeof(wpr_data_rx.data) - 2))
+            {
+                printf("Audio data missing!\n");
+                return;
             }
-        } else {
-            printf("Ignoring channel ID: %u", channel);
-            return;
+
+            if (!ch->active)
+            {
+                printf("Channel %u: PTT start\n", channel);
+                ch->active = 1;
+            }
+            ch->last_rx_ns = now_ns();
+
+            uint8_t *audio_ptr = (uint8_t *)malloc(audio_len);
+            memcpy(audio_ptr, wpr_data_rx.data + 2, audio_len);
+            decode_codec2_voice_data(audio_ptr, audio_len);
+            free(audio_ptr);
         }
+        else
+        {
+            if (ch->active)
+            {
+                printf("Channel %u: PTT end\n", channel);
+                ch->active = 0;
+            }
+        }
+    }
+    else
+    {
+        printf("Ignoring channel ID: %u", channel);
+        return;
+    }
 }
 
-//This code will take the radio message, and decode it, and if it is a WPR message (WiFiPacketRadio), then decode it further.
 static void parse_radio_message(const uint8_t *pkt, size_t len, const struct pcap_pkthdr *pcaphdr)
 {
-    //Start to decode the ieee80211_radiotap_header data
+    // TODO: Implement FCS data framing
+    //  Start to decode the ieee80211_radiotap_header data
     struct ieee80211_radiotap_header *rt_hdr = (struct ieee80211_radiotap_header *)pkt;
 
-    if (len < sizeof(*rt_hdr)){
-        printf("len < sizeof(*rt_hdr)\n");
+    if (len < sizeof(*rt_hdr))
+    {
         return;
     }
 
     uint16_t rt_hdr_len = le16toh(rt_hdr->it_len);
-    if (rt_hdr_len > len){
-        printf("rt_hdr_len > len \n");
+    if (rt_hdr_len > len)
+    {
         return;
     }
-        
 
     const uint8_t *mac_ptr = pkt + rt_hdr_len;
     size_t mac_len = len - rt_hdr_len;
 
     if (debugRadioData)
+    {
         printf("Total packet len: %zu, Radiotap len: %u, MAC + data len: %zu\n", len, rt_hdr_len, mac_len);
+        for (size_t i = 0; i < len; i++)
+        {
+            printf("%02x ", pkt[i]);
+        }
+        printf("\n");
+    }
 
+    // Not a radiotap message
     struct ieee80211_radiotap_iterator it;
-    if (ieee80211_radiotap_iterator_init(&it, rt_hdr, rt_hdr_len, NULL) < 0){
-        printf("ieee80211_radiotap_iterator_init(&it, rt_hdr, rt_hdr_len, NULL) < 0\n");
+    if (ieee80211_radiotap_iterator_init(&it, rt_hdr, rt_hdr_len, NULL) < 0)
+    {
+        // printf("ieee80211_radiotap_iterator_init(&it, rt_hdr, rt_hdr_len, NULL) < 0\n");
+        // //print the data
+        // fprintf(stderr, "TX: send_test_tone payload_len=%u data:", len);
+        // for (size_t i = 0; i < (size_t)len; ++i)
+        //     fprintf(stderr, " %02x", pkt[i]);
+        // fprintf(stderr, "\n");
         return;
     }
-        
 
     while (ieee80211_radiotap_iterator_next(&it) == 0)
     {
@@ -827,11 +916,11 @@ static void parse_radio_message(const uint8_t *pkt, size_t len, const struct pca
         printf("\n");
 
     // Start to decode the ieee80211_mac_hdr data
-    if (mac_len <= 24){
-        printf("MAC data header too small to process\n");
+    if (mac_len <= 24)
+    {
+        // printf("MAC data header too small to process\n");
         return;
     }
-
 
     struct ieee80211_mac_hdr *mac_hdr = (struct ieee80211_mac_hdr *)mac_ptr;
     uint16_t fc = le16toh(mac_hdr->fc);
@@ -849,15 +938,17 @@ static void parse_radio_message(const uint8_t *pkt, size_t len, const struct pca
         printf("\n");
     }
 
-    //Check if it is a broadcast message on addr1 on the mac_hdr level.
-    if (memcmp(mac_hdr->addr1, macBroadcast, 6) != 0){
-        printf("Not broadcast address...\n");
+    // Check if it is a broadcast message on addr1 on the mac_hdr level.
+    if (memcmp(mac_hdr->addr1, macBroadcast, 6) != 0)
+    {
+        // printf("Not broadcast address...\n");
         return;
     }
 
-    //Check if is "our" own packet, abort processing, otherwise continue.
-    if (memcmp(mac_hdr->addr3, hwMAC, 6) == 0){
-        printf("Own frame detected, aborting...\n");
+    // Check if is "our" own packet, abort processing, otherwise continue.
+    if (memcmp(mac_hdr->addr3, hwMAC, 6) == 0)
+    {
+        // printf("Own frame detected, aborting...\n");
         return;
     }
 
@@ -871,35 +962,58 @@ static void parse_radio_message(const uint8_t *pkt, size_t len, const struct pca
     // }
 
     // TODO -> split this to a seperate function.
-    if (mac_len <= hdr_len){
-        printf("mac_len <= hdr_len\n");
+    if (mac_len <= hdr_len)
+    {
+        // printf("mac_len <= hdr_len\n");
         return;
     }
 
     const uint8_t *body_start = mac_ptr + hdr_len;
-    size_t body_len = mac_len - hdr_len;
+    size_t body_len = (mac_len - hdr_len);
 
-    if (body_len < sizeof(struct wpr_data)){
-        printf("body_len < sizeof(struct wpr_data)\n");
+    if (body_len < sizeof(struct wpr_data))
+    {
+        // printf("body_len < sizeof(struct wpr_data)\n");
         return;
     }
-        
+
     /* Check first 4 bytes */
     uint32_t magic;
     memcpy(&magic, body_start, sizeof(uint32_t));
 
-    if (magic != DATA_HDR_MAGIC){
+    if (debugRadioData)
+    {
+        printf("magic value: %u\n", magic);
+        printf("body_len: %lu\n", body_len);
+        printf("Body (%zu bytes):\n", body_len);
+
+        for (size_t i = 0; i < body_len; i++)
+        {
+            printf("%02x ", body_start[i]);
+
+            if ((i + 1) % 16 == 0)
+                printf("\n");
+        }
+
+        if (body_len % 16 != 0)
+            printf("\n");
+    }
+
+    if (magic != DATA_HDR_MAGIC)
+    {
+        printf("magic value: %u", magic);
         printf("magic != DATA_HDR_MAGIC\n");
         return;
     }
-        
 
-    if (body_len != sizeof(struct wpr_data)){
-        printf("body_len != sizeof(struct wpr_data)\n");
-        return;
-    }
-        
-    
+    // if (body_len >= sizeof(struct wpr_data))
+    // {
+    //      if (debugRadioData)
+    //      {
+    //      printf("WARN: body_len >= sizeof(struct wpr_data)\n");
+    //      }
+    // }
+
     memcpy(&wpr_data_rx, body_start, sizeof(struct wpr_data));
     process_wpr_data_rx();
 }
@@ -919,15 +1033,20 @@ static void gen_tone(int16_t *pcm, int n)
 
 static int send_wav(const char *filename)
 {
+    if (debug)
+    {
+        printf("Sending WAV file...\n");
+    }
+
     if (codec2 == NULL)
     {
         fprintf(stderr, "Codec2 not initialized (send_wav)\n");
         return -1;
     }
 
-    //Prepare the wpr_data_tx struct
+    // Prepare the wpr_data_tx struct
     wpr_data_tx.data_type = RADIO_DATA_AUDIO;
-    wpr_data_tx.data[1] = 1; //PTT is ON
+    wpr_data_tx.data[1] = 1; // PTT is ON
 
     wavFile = fopen(filename, "rb");
     if (!wavFile)
@@ -952,8 +1071,8 @@ static int send_wav(const char *filename)
     }
 
     printf("Transmitting WAV file: %s  (mono 8kHz 16-bit PCM)\n", filename);
-    int codec2_encoded_bytecount = codec2_bytes_per_frame(codec2);      // 160 samples for MODE_2400, 160 samples for MODE_3200
-    int codec2_decoded_bytecount = codec2_samples_per_frame(codec2);    // 6 bytes for MODE_2400, 8 bytes for MODE_3200
+    int codec2_encoded_bytecount = codec2_bytes_per_frame(codec2);   // 160 samples for MODE_2400, 160 samples for MODE_3200
+    int codec2_decoded_bytecount = codec2_samples_per_frame(codec2); // 6 bytes for MODE_2400, 8 bytes for MODE_3200
 
     int16_t pcm_in[codec2_decoded_bytecount];
     uint8_t codec2_out[codec2_encoded_bytecount];
@@ -979,12 +1098,12 @@ static int send_wav(const char *filename)
         if ((int64_t)send_radio_data(&wpr_data_tx, sizeof(wpr_data_tx)) < 0)
         {
             fprintf(stderr, "send_wav: radio send failed, stopping transmitter loop\n");
+            cleanup();
             break;
         }
 
         total_frames++;
-        usleep(15000); // Since PCM is about 20ms per sample, make it so that we send a bit faster than real-time to account for processing delays and ensure smooth transmission.
-                       // The receiver can handle some jitter, but we want to avoid large gaps that could cause timeouts or stuttering.
+        usleep(20000);
 
         if (!running)
         {
@@ -999,22 +1118,26 @@ static int send_wav(const char *filename)
 
 static void send_test_tone(void)
 {
+    if (debug)
+    {
+        printf("Sending test tone...\n");
+    }
+
     if (codec2 == NULL)
     {
         fprintf(stderr, "Codec2 not initialized (send_wav)\n");
         cleanup();
     }
 
-    //Prepare the wpr_data_tx struct
+    // Prepare the wpr_data_tx struct
     wpr_data_tx.data_type = RADIO_DATA_AUDIO;
-    wpr_data_tx.data[1] = 1; //PTT is ON
-
+    wpr_data_tx.data[1] = 1; // PTT is ON
 
     // Generate PCM tone
     gen_tone(pcmToneBuffer, TEST_TONE_INTERVAL);
 
-    int codec2_encoded_bytecount = codec2_bytes_per_frame(codec2);      // 160 samples for MODE_2400, 160 samples for MODE_3200
-    int codec2_decoded_bytecount = codec2_samples_per_frame(codec2);    // 6 bytes for MODE_2400, 8 bytes for MODE_3200
+    int codec2_encoded_bytecount = codec2_bytes_per_frame(codec2);   // 160 samples for MODE_2400, 160 samples for MODE_3200
+    int codec2_decoded_bytecount = codec2_samples_per_frame(codec2); // 6 bytes for MODE_2400, 8 bytes for MODE_3200
 
     int16_t pcm_in[codec2_decoded_bytecount];
     uint8_t codec2_out[codec2_encoded_bytecount];
@@ -1038,20 +1161,27 @@ static void send_test_tone(void)
         /* copy exactly codec_bytes into payload */
         memcpy(wpr_data_tx.data + 2, codec2_out, (size_t)codec2_encoded_bytecount);
 
-        static int dbg_cnt = 0;
-        if ((dbg_cnt++ & 0x3F) == 0)
+        if (debugRadioData)
         {
-            fprintf(stderr, "TX: send_test_tone payload_len=%u data:", codec2_encoded_bytecount);
-            for (size_t i = 0; i < (size_t)codec2_encoded_bytecount; ++i)
-                fprintf(stderr, " %02x", codec2_out[i]);
-            fprintf(stderr, "\n");
+            static int dbg_cnt = 0;
+            if ((dbg_cnt++ & 0x3F) == 0)
+            {
+                fprintf(stderr, "TX: send_test_tone payload_len=%u data:", codec2_encoded_bytecount);
+                for (size_t i = 0; i < (size_t)codec2_encoded_bytecount; ++i)
+                    fprintf(stderr, " %02x", codec2_out[i]);
+                fprintf(stderr, "\n");
+            }
         }
 
         if ((int64_t)send_radio_data(&wpr_data_tx, sizeof(wpr_data_tx)) < 0)
         {
             fprintf(stderr, "send_test_tone: radio send failed, stopping transmitter loop\n");
+            cleanup();
             break;
         }
+
+        // usleep 20ms here
+        usleep(20000);
 
         if (!running)
         {
@@ -1067,7 +1197,7 @@ static int setup_audio_socket(void)
     if (s < 0)
     {
         perror("socket");
-        exit(1);
+        cleanup();
     }
 
     int one = 1;
@@ -1105,7 +1235,8 @@ static void detect_phy(const char *phy)
     }
 }
 
-static void printParameters(void){
+static void printParameters(void)
+{
     printf("Parameters: <programName> <rx/tx> <audiofilename-to-tx>\n");
 }
 
@@ -1113,15 +1244,19 @@ static void do_main_loop(int argc, char *argv[])
 {
     char *wav;
 
-    if (argc == 0){
+    if (argc == 0)
+    {
         printf("No parameters specified. Aborting!\n");
         printParameters();
         cleanup();
     }
-    
-    if (argc >= 2){
-        if (argc == 2){
-            //We assume we put in a variable for rx and tx.
+
+    if (argc >= 2)
+    {
+        if (argc == 2)
+        {
+            printf("argc == 2\n");
+
             if (strcmp(argv[1], "tx") == 0)
             {
                 isRadioTransmitting = true;
@@ -1137,11 +1272,14 @@ static void do_main_loop(int argc, char *argv[])
             }
         }
 
-        if (argc == 3){
-            //We assume we put in a variable for rx and tx.
+        if (argc == 3)
+        {
+
+            printf("argc == 3\n");
+
             if (strcmp(argv[1], "rx") == 0)
             {
-                printf("One cannot receive while transmitting audio, just yet.");
+                printf("One cannot receive while transmitting audio, just yet.\n");
                 cleanup();
             }
             else if (strcmp(argv[1], "tx") == 0)
@@ -1150,7 +1288,7 @@ static void do_main_loop(int argc, char *argv[])
             }
             else
             {
-                printf("Unknown parameter, aborting.");
+                printf("Unknown parameter, aborting.\n");
                 cleanup();
             }
 
@@ -1158,20 +1296,23 @@ static void do_main_loop(int argc, char *argv[])
         }
     }
 
-    if (isRadioTransmitting && isRadioReceiving){
+    if (isRadioTransmitting && isRadioReceiving)
+    {
         printf("One cannot transmit and receive just yet!");
         cleanup();
     }
-
 
     setup_radio();
     setup_codec2();
 
     if (isRadioTransmitting)
+    {
         printf("Radio transmitting enabled.\n");
+    }
 
     if (isRadioReceiving)
     {
+        printf("Radio receiving enabled.\n");
         // //Setup audio ringbuffer
         // if (ringbuffer_init(&audioBuf, 1024, "audioBuff") != 0) {
         //     fprintf(stderr, "audiobuff init failed\n");
@@ -1204,67 +1345,73 @@ static void do_main_loop(int argc, char *argv[])
     {
         fprintf(stderr, "Codec2 not initialized (do_main_loop)\n");
         cleanup();
-        exit(1);
     }
 
     while (running)
     {
-
         if (isRadioTransmitting)
         {
-            if (wav != NULL){
+            printf("Stage 2\n");
+            if (wav != NULL)
+            {
+                printf("Stage 3\n");
                 if (wav[0] != '\0')
                 {
+                    printf("Stage WAV\n");
                     send_wav(wav);
                     sleep(2);
                 }
                 else
                 {
+                    printf("Stage 4\n");
                     send_test_tone();
                 }
+            }
+            else
+            {
+                printf("Stage Tone\n");
+                send_test_tone();
             }
         }
 
         if (isRadioReceiving)
         {
-            if (usePcapForRx)
+            struct pcap_pkthdr hdr;
+            const uint8_t *pkt;
+
+            // Drain all available packets
+            while ((pkt = pcap_next(pcap_handle, &hdr)) != NULL)
             {
-                struct pcap_pkthdr hdr;
-                const uint8_t *pkt;
-
-                // Drain all available packets
-                while ((pkt = pcap_next(pcap_handle, &hdr)) != NULL)
-                {
-                    parse_radio_message(pkt, hdr.caplen, &hdr);
-                    codec2_timeout_check();
-                }
+                parse_radio_message(pkt, hdr.caplen, &hdr);
+                codec2_timeout_check();
             }
-            else
-            {
-                // Drain ring buffer aggressively to prevent overflow
-                unsigned int processed = 0;
-                unsigned int max_drain = 64; // Process up to 64 frames per iteration
 
-                while (processed < max_drain)
-                {
-                    struct tpacket_hdr *hdr = (struct tpacket_hdr *)((uint8_t *)ring + frame * FRAME_SIZE);
+            // else
+            // {
+            //     // Drain ring buffer aggressively to prevent overflow
+            //     unsigned int processed = 0;
+            //     unsigned int max_drain = 64; // Process up to 64 frames per iteration
 
-                    if (!(hdr->tp_status & TP_STATUS_USER))
-                        break; // No more frames in buffer
+            //     while (processed < max_drain)
+            //     {
+            //         struct tpacket_hdr *hdr = (struct tpacket_hdr *)((uint8_t *)ring + frame * FRAME_SIZE);
 
-                    uint8_t *pkt = (uint8_t *)hdr + hdr->tp_mac;
-                    size_t pktlen = hdr->tp_snaplen;
-                    parse_radio_message(pkt, pktlen, (struct pcap_pkthdr *)hdr);
-                    codec2_timeout_check();
+            //         if (!(hdr->tp_status & TP_STATUS_USER))
+            //             break; // No more frames in buffer
 
-                    hdr->tp_status = TP_STATUS_KERNEL;
-                    frame = (frame + 1) % frame_nr;
-                    processed++;
-                }
-            }
+            //         uint8_t *pkt = (uint8_t *)hdr + hdr->tp_mac;
+            //         size_t pktlen = hdr->tp_snaplen;
+            //         parse_radio_message(pkt, pktlen, (struct pcap_pkthdr *)hdr);
+            //         codec2_timeout_check();
+
+            //         hdr->tp_status = TP_STATUS_KERNEL;
+            //         frame = (frame + 1) % frame_nr;
+            //         processed++;
+            //     }
+            // }
         }
 
-        usleep(100); // Allow other processes CPU time
+        usleep(10); // Allow other processes CPU time
     }
 }
 
@@ -1294,7 +1441,6 @@ int main(int argc, char *argv[])
     {
         do_main_loop(argc, argv);
     }
-
 
     cleanup();
     return 0;
