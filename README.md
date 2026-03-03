@@ -1,15 +1,11 @@
 # WiFiPacketRadio
 Crude method in transmitting compressed audio over WiFi packet injection and receiving it on monitor mode WiFi radios.  
 
-Make sure that you have a WiFi radio/adapter that has Packet injection support, and another radio for monitor mode. (Most wireless radios support monitor mode)  
-
-My idea is, to build a complete system, that runs on a cheap WiFi radio module (OpenWRT, HLK7628 from Hi-Link) with a soundcard and GPIO pin for PTT and transmit/receive audio over the WiFi link, much like a walkie-talkie or handheld transceiver 
+Make sure that you have a WiFi radio/adapter that has packet injection support, and another radio for monitor mode. (Most wireless radios support monitor mode)  
 
 This project is just a proof-of-concept that I can transmit compressed audio, receive it on another device and decode it, pipe the decompressed PCM samples through a socket for aplay stdin consumption on a remote computer.   
+Currently using a Raspberry Pi Zero 2 W, with a RTL8812EU as wireless radio. CPU usage is minimal, but will scale a bit once we implement more features.   
 
-At this stage, due to the MIPS radio's inability to keep up with the sent packet rate and "stuttering", I was thinking of maybe doing the following:  
-
-Port this to a Raspberry Pi Zero 2 W, with a RTL8812EU as wireless radio, and try again. Chances are, that it will give the same problem of "stuttering" audio, eventually.  
 
 ## TODO
 - Implement a small RX audio buffer (consisting about 60ms) sampled audio, and send it to the audio layer. This is to avoid the "stuttering" of the packets arriving not on the same timeframe  
@@ -21,9 +17,6 @@ front of the convoy transmits, the middle vehicle receives it, and relays it bac
 - Build a "Pi powered" HT (handheld transceiver) unit, with a LCD, buttons and LiPo cell. (Will be expensive in small numbers) or a similar system.  
 - Implement selective private comms by radio ID or MAC, say, between vehicle 1 and 3, without vehicle 2 hearing the conversation.  
 
-## Very nice to do
-- Port this code-base and wireless driver code to something like Circle, running baremetal C++ code: https://github.com/rsta2/circle
-
 ## Notice
 Please make sure you are able to transmit such WiFi packets arbitrarily. Use this code on your own risk!  
 
@@ -33,7 +26,7 @@ Please do not open a issue on why you cannot compile the code or anything like t
 You may use the code as a template or whatever. Go read the license.
 
 ## AI Notice
-Has been vibe-coded heavily, and made some pure C developers turn in their graves with my patchy code, spewing memory leaks and violating coding rules.  
+Has been using AI to aid in development, and made some pure C developers turn in their graves with my patchy code, spewing memory leaks and violating coding rules.  
 
 I also had modified a lot of code, since the AI can't really code, more of a theorist than a realist.  
 
@@ -41,16 +34,13 @@ I also had modified a lot of code, since the AI can't really code, more of a the
 Uses [Codec2](https://github.com/drowe67/codec2) from drowe67, to compress PCM samples to transmit raw bytes over WiFi. Quite impressive. Thanks, mate!  
 Uses [RadioTap](https://github.com/radiotap/radiotap-library) from the Radiotap org, but extended heavily on the debug logs and parser they had.  
 Heavily inspired by [WFB-ng](https://github.com/svpcom/wfb-ng)  
-Uses zfec by tahoe-lafs [zfec](https://tahoe-lafs.org/trac/zfec/)  
-Uses GStreamer libs for the potential audio/packet jitter caused by delayed receives  
-
+Will use zfec by tahoe-lafs [zfec](https://tahoe-lafs.org/trac/zfec/)  
+Will GStreamer libs soon, for the potential audio/packet jitter caused by delayed receives  
 
 ## Further notes
-Seems like CPU usage spikes to about 90% on MIPS when transmitting, but about 70% when receiving.  
-(Single core MIPS device, used top utility)  
+There may be some audio micro-stuttering, but YMMV. Intend to improve this by using GStreamer libs to eliminate issue, hopefully.
 
-There may be some audio glitches (timing related?) but YMMV. 
-
+## Deprecated
 Current mt76 OpenWRT builds/releases crashes on packet injection.  
 Manually patched mt76 driver [mt76-pktinject](https://github.com/RuhanSA079/mt76-pktinject)  
 
