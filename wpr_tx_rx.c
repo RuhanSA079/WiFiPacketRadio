@@ -4,8 +4,8 @@
  The author takes no responsibility whatsoever for any damages caused, directly or indirectly, when using this program/source code.
  Please check with your country's radio licensing spectrum and power limits, as per regulatory domain.
  This program is developed as a proof-of-concept, as a experimental means to see how far 2.4 Ghz and 5Ghz radio packets being transmitted, can be received reliably.
- The author intends to use a higher power wireless radio (1 watt/30dBm) on 5Ghz, nothing more, to experiment with the range of radio packets TXed and RXed
-
+ The author intends to use a higher power wireless radio (1 watt/30dBm) on 5Ghz, nothing more, to experiment with the range of radio packets TXed and RXed.
+ This is all for science...
 
  The mt76 target is considered deprecated, as the stringent "clocking" requirements are too strict, and "stutters" the audio, and driver overheads causing timing issues. (transmit)
  The author intends to test this WiFiPacketRadio experiment on a AMD64 laptop, and a Raspberry Pi Zero 2W or Raspberry Pi CM4 as client devices, with a patched RTL8812AU/EU driver.
@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <linux/spi/spidev.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -47,12 +48,16 @@
 #include <codec2/codec2.h>
 #include "fec.h"
 #include "ringbuffer.h"
+#include <alsa/asoundlib.h>
 
-// on Raspberry-Pi
+
 #if defined(__x86_64__) || defined(_M_X64)
 #define RADIO_IFACE "wlan0"
 #else
 #define RADIO_IFACE "wlan1"
+#define SPI_DISPLAY_ENABLED true
+#include <gpiolib.h>
+#define USE_INA219_SENSOR
 #endif
 
 #define AUDIO_CHANNEL_ID 1
@@ -72,14 +77,31 @@
 #define FC_TO_DS(fc) ((fc) & 0x0100)
 #define FC_FROM_DS(fc) ((fc) & 0x0200)
 
+#define SAMPLE_RATE 8000
+#define CHANNELS 1
+#define FORMAT SND_PCM_FORMAT_S16_LE
+#define PERIOD_FRAMES 1024                  //Tunable
+#define BUFFER_FRAMES (PERIOD_FRAMES * 4)   //Tunable??
+
+#define ONE_MS_IN_US 1000
+
+static const char *SPI_DEV = "/dev/spidev0.0";
+static const uint32_t SPI_SPEED = 32000000; // 32 MHz
+static const uint8_t SPI_MODE = SPI_MODE_0;
+static const uint8_t BITS_PER_WORD = 8;
+
 // RadioTap message seems to work like this:
 //  Radiotap_hdr -> header data defining the radio's settings, rates, enable/disable certain features, etc.
 //  ieee80211_mac_hdr -> Header data that contains the data frame stuff, duration and then the three MAC addresses, as well as the frame sequence number.
-//  Raw data -- My raw data that I send (c2c2c2c2 + channel data + audio data, etc.)
-
+//  Raw data -- The raw data that I send (c2c2c2c2 + channel data + audio data, etc.)
+#define WPR_TX_QUEUE_SZ 8
 #define RADIO_DATA_NOOP 0x00
 #define RADIO_DATA_AUDIO 0x01
 #define RADIO_DATA_MESH 0x02
+#define RADIO_DATA_MESH_MSG_DISCOVERY_PING 0xFA
+#define RADIO_DATA_MESH_MSG_DISCOVERY_PONG 0xFB
+#define RADIO_DATA_MESH_MSG_FORWARD_AUDIO 0xCA
+
 #define MCS_VALUES (IEEE80211_RADIOTAP_MCS_HAVE_MCS | IEEE80211_RADIOTAP_MCS_HAVE_BW | IEEE80211_RADIOTAP_MCS_HAVE_GI | IEEE80211_RADIOTAP_MCS_HAVE_STBC | IEEE80211_RADIOTAP_MCS_HAVE_FEC)
 #define IEEE80211_FTYPE_DATA 0x0008
 // Stock standard radio struct:
@@ -99,15 +121,29 @@
 //      Codec2 data -> 8 bytes
 //      Total bytes: 10
 // 2. Mesh data
-//      Own radio MAC -> 6 bytes
-//      Remote radio MAC -> 6 bytes
-//      Mesh data -> 4 extra bytes
-
+//      Message type -> 1 byte
+//      Destination MAC -> 6 bytes
+//      Message contents -> 9 bytes long
+//      
 // FEC data
 //      4 bytes or 6?
 
 // From this, it derived that the maximum amount of "data" we can send, is 16 bytes, max.
 // Can be adjusted later in the struct
+
+struct peer_nodes
+{
+    uint8_t nodeID[6];      //MAC address of peer
+    uint64_t lastSeen_us;   //Last time it was seen by us.
+};
+
+//One more byte available to send
+struct wpr_mesh
+{
+    uint8_t msgtype; // Message type -> 1 byte
+    uint8_t dst[6];  // Destination -> 6 bytes
+    uint8_t msg[8];  // 9 bytes of message. (audio or time in 8 bytes)
+};
 
 struct wpr_data
 {
@@ -116,6 +152,14 @@ struct wpr_data
     uint8_t data[16];
     uint8_t fec[6];
 } __attribute__((packed));
+
+
+struct wpr_queue {
+    struct wpr_data items[WPR_TX_QUEUE_SZ];
+    uint8_t head;   // index of oldest element
+    uint8_t tail;   // index to place new element
+    uint8_t len;    // Size of the wpr_queue
+};
 
 // Stock-standard 802.11 headers
 struct ieee80211_mac_hdr
@@ -148,22 +192,18 @@ struct radiotap_hdr
 struct audio_channel_state
 {
     int active;
-    uint64_t last_rx_ns;
+    uint64_t last_rx_us;
 };
 
 /* ---------------- some variables ---------------- */
 
-// Ringbuffer stuff for receiving packets via PACKET_RX_RING
-static void *ring = NULL;
-static size_t ring_size;
-static unsigned int frame_nr;
 
 // Codec2 stuff
 struct CODEC2 *codec2 = NULL;
 
 unsigned char *hwMAC;          // Hardware MAC address of the radio interface, used for filtering out our own transmitted packets.
 unsigned char macBroadcast[6]; // Broadcast MAC address for filtering incoming packets (set to ff:ff:ff:ff:ff:ff).
-int radio_fd, pcap_fd, audio_in_fd, audio_out_fd = 0;
+int radio_fd, pcap_fd, audio_in_fd, spi_fd, i2c_fd = 0;
 
 bool debug = false;
 bool debugRadioData = false;
@@ -171,18 +211,15 @@ volatile sig_atomic_t running = 1;
 bool isRadioReceiving = false;
 bool isRadioTransmitting = false;
 bool useQDiscBypass = true;
-
-static int tcp_listen = 0;
+bool usingPcap = true;
+bool usingDisplay = false;
 static double phase = 0.0;
 
 uint64_t last_tx_test_tone = 0;
 struct sockaddr_ll sll;
-static FILE *wavFile = NULL;
 
 pcap_t *pcap_handle = NULL;
-
 uint16_t hdr_seq_tx = 0;
-
 uint8_t mcs_flags = 0;
 
 struct wpr_data wpr_data_rx;
@@ -192,6 +229,7 @@ struct radiotap_hdr_data rtap_hdr_data_tx;
 struct radiotap_hdr rtap_tx;
 
 static struct audio_channel_state channels[4];
+static struct wpr_queue tx_queue;
 
 #define PCM_BYTE_COUNT 160                             /* 20 ms of mono audio at 8 kHz */
 #define PCM_100MS_BYTE_COUNT (PCM_BYTE_COUNT * 5)      // enough for 100 ms of audio, 160 bytes per 20 ms frame * 5 = 800 bytes
@@ -199,22 +237,106 @@ static struct audio_channel_state channels[4];
 
 int16_t pcmToneBuffer[TEST_TONE_INTERVAL]; // about 1 second of tone at 8 kHz, 160 samples per 20 ms frame, so 160 * 5 = 800 bytes per 100 ms, so 800 * 10 = 8000 bytes for 1 second
 
-RingBuffer audioBuf;
+//RingBuffer audioBuf;
+snd_pcm_t *pcmDevice;
+bool soundCardFound = false;
+uint16_t discoveryFrameCounter = 0;
+uint16_t discoveryFrameCounterOnLCD = 0;
 
-static uint64_t now_ns(void)
+#define SPI_DISPLAY_RST 22
+#define SPI_DISPLAY_CMD 24
+#define SPI_DISPLAY_BKL 12
+#define TFT_HEIGHT 160
+#define TFT_WIDTH 128
+
+#define APP_VERSION "WPR dev-0.1.1"
+#define HEART_BLINK_INTERVAL_S 1 // heartbeat every second
+#define FONT_SPACING 1           // extra spacing between chars
+#define TOP_MARGIN 2
+#define RIGHT_MARGIN 2
+#define CENTER_MARGIN 0
+
+// Sensor section
+#define INA219_SENSOR_ADDR 0x40
+#define INA219_SENSOR_X 0
+
+
+unsigned gpio_rst, gpio_cmd, gpio_bl = 0;
+
+static void init_tx_queue(void)
+{
+    tx_queue.head = 0;
+    tx_queue.tail = 0;
+    tx_queue.len  = 0;
+}
+
+static bool wpr_enqueue(const struct wpr_data *pkt)
+{
+    bool ok = false;
+    if (pkt == NULL) return false;
+
+    if (tx_queue.len < WPR_TX_QUEUE_SZ)
+    {
+        // copy packet into tail
+        memcpy(&tx_queue.items[tx_queue.tail], pkt, sizeof(struct wpr_data));
+        tx_queue.tail = (tx_queue.tail + 1) % WPR_TX_QUEUE_SZ;
+        tx_queue.len++;
+        ok = true;
+    }
+
+    return ok;
+}
+
+static bool wpr_dequeue(struct wpr_data *out_pkt)
+{
+    bool ok = false;
+    if (out_pkt == NULL) return false;
+
+    if (tx_queue.len > 0)
+    {
+        memcpy(out_pkt, &tx_queue.items[tx_queue.head], sizeof(struct wpr_data));
+        tx_queue.head = (tx_queue.head + 1) % WPR_TX_QUEUE_SZ;
+        tx_queue.len--;
+        ok = true;
+    }
+    return ok;
+}
+
+static bool wpr_peek(struct wpr_data *out_pkt)
+{
+    bool ok = false;
+    if (out_pkt == NULL) return false;
+
+    if (tx_queue.len > 0)
+    {
+        memcpy(out_pkt, &tx_queue.items[tx_queue.head], sizeof(struct wpr_data));
+        ok = true;
+    }
+
+    return ok;
+}
+
+static uint64_t now_us(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    return ((uint64_t)ts.tv_sec * 1000000ULL) + (ts.tv_nsec / 1000ULL);
 }
 
 static void cleanup(void)
 {
     running = 0;
 
-    if (ring)
+    if (i2c_fd > 0)
     {
-        munmap(ring, ring_size);
+        close(i2c_fd);
+        i2c_fd = 0;
+    }
+
+    if (spi_fd > 0)
+    {
+        close(spi_fd);
+        spi_fd = 0;
     }
 
     if (radio_fd > 0)
@@ -241,18 +363,16 @@ static void cleanup(void)
         audio_in_fd = 0;
     }
 
-    if (audio_out_fd > 0)
-    {
-        close(audio_out_fd);
-        audio_out_fd = 0;
-    }
-    if (wavFile)
-        fclose(wavFile);
-
     if (codec2 != NULL)
     {
         codec2_destroy(codec2);
         codec2 = NULL;
+    }
+
+    if (pcmDevice != NULL){
+        snd_pcm_drain(pcmDevice);
+        snd_pcm_close(pcmDevice);
+        pcmDevice = NULL;
     }
 
     exit(0);
@@ -261,6 +381,7 @@ static void cleanup(void)
 static void sigint(int sig)
 {
     (void)sig;
+    printf("\nApplication signal caught. Exiting.\n");
     running = 0;
     cleanup();
 }
@@ -274,6 +395,27 @@ static void root_check(void)
     }
 }
 
+static int set_fd_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) {
+        perror("fcntl(F_GETFL)");
+        return -1;
+    }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("fcntl(F_SETFL)");
+        return -1;
+    }
+    return 0;
+}
+
+char *mac_to_string(const uint8_t mac[6])
+{
+    static char mac_str[18];
+    sprintf(mac_str, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return mac_str;
+}
+
 static void run_cmd(const char *cmd)
 {
     int ret = system(cmd);
@@ -284,6 +426,430 @@ static void run_cmd(const char *cmd)
     }
 }
 
+#ifdef SPI_DISPLAY_ENABLED
+
+static bool init_gpio(void)
+{
+
+    if (gpiolib_init() < 0) {
+        fprintf(stderr, "gpiolib_init failed\n");
+        return false;
+    }
+
+    // Stage 2: map MMIO (requires privileges)
+    if (gpiolib_mmap() != 0) {
+        perror("gpiolib_mmap");
+        return false;
+    }
+
+    // Ensure pin range initialised (recommended by the docs)
+    unsigned first, last;
+    gpio_get_pin_range(&first, &last);
+
+    gpio_set_fsel(SPI_DISPLAY_BKL, GPIO_FSEL_GPIO);
+    gpio_set_fsel(SPI_DISPLAY_CMD, GPIO_FSEL_GPIO);
+    gpio_set_fsel(SPI_DISPLAY_RST, GPIO_FSEL_GPIO);
+
+    gpio_set_dir(SPI_DISPLAY_BKL, DIR_OUTPUT);
+    gpio_set_dir(SPI_DISPLAY_CMD, DIR_OUTPUT);
+    gpio_set_dir(SPI_DISPLAY_RST, DIR_OUTPUT);
+
+    gpio_clear(SPI_DISPLAY_BKL);
+    gpio_clear(SPI_DISPLAY_CMD);
+    gpio_clear(SPI_DISPLAY_RST);
+
+    return true;
+}
+
+int spi_write_bytes(const uint8_t *buf, size_t len) {
+    struct spi_ioc_transfer tr = {0};
+    tr.tx_buf = (unsigned long)buf;
+    tr.rx_buf = 0;
+    tr.len = len;
+    tr.delay_usecs = 0;
+    tr.speed_hz = SPI_SPEED;
+    tr.bits_per_word = BITS_PER_WORD;
+    if (ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr) < 1) { perror("spi_send"); return -1; }
+    return 0;
+}
+
+int init_spi_bus(void) {
+    spi_fd = open(SPI_DEV, O_RDWR);
+    if (spi_fd < 0) { perror("open spi"); return -1; }
+    if (ioctl(spi_fd, SPI_IOC_WR_MODE, &SPI_MODE) < 0) { perror("mode"); return -1; }
+    if (ioctl(spi_fd, SPI_IOC_WR_BITS_PER_WORD, &BITS_PER_WORD) < 0) { perror("bits"); return -1; }
+    if (ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &SPI_SPEED) < 0) { perror("speed"); return -1; }
+    return 0;
+}
+
+void send_command(uint8_t cmd) {
+    gpio_clear(SPI_DISPLAY_CMD); //0
+    spi_write_bytes(&cmd, 1);
+}
+
+void send_data(const uint8_t *data, size_t len) {
+    gpio_set(SPI_DISPLAY_CMD); //1
+    spi_write_bytes(data, len);
+}
+
+void st7735_init_sequence(void) {
+    // Hardware reset
+    gpio_clear(SPI_DISPLAY_RST); //0
+    usleep(20000);
+    gpio_set(SPI_DISPLAY_RST); //1
+    usleep(20000);
+
+    send_command(0x01); // Software reset
+    usleep(15000);
+
+    send_command(0x11); // Sleep out
+    usleep(15000);
+
+    // Frame rate / inversion / color mode / etc — depends on module
+    send_command(0x3A); // COLMODE
+    uint8_t col = 0x05; // 16-bit/pixel (RGB565) for many ST7735 modules
+    send_data(&col, 1);
+
+    send_command(0x29); // Display ON
+    usleep(10000);
+}
+
+static bool init_spi_display(){
+    if (!init_gpio()) return false;
+
+    if (init_spi_bus() < 0) return false;
+    st7735_init_sequence();
+
+    //Switch on the backlight GPIO pin
+    gpio_set(SPI_DISPLAY_BKL);
+    return true;
+}
+
+void fill_screen_black(void) {
+
+    // Column address: CASET (0x2A) -> start col high, start col low, end col high, end col low
+    send_command(0x2A);
+    uint8_t coldata[4] = { 0x00, 0x00, 0x00, 0x7F }; // 0..127
+    send_data(coldata, 4);
+
+    // Row address: RASET (0x2B)
+    send_command(0x2B);
+    uint8_t rowdata[4] = { 0x00, 0x00, 0x00, 0x9F }; // 0..159
+    send_data(rowdata, 4);
+
+    // Memory write
+    send_command(0x2C);
+
+    // Stream pixel data in chunks to avoid huge allocations.
+    // Each pixel is 2 bytes for RGB565. For black: 0x00, 0x00.
+    const size_t PIXELS = TFT_WIDTH * TFT_HEIGHT;
+    const size_t BYTES_TOTAL = PIXELS * 2;
+    const size_t CHUNK_BYTES = 4096; // choose a chunk size (must be even)
+    uint8_t chunk[CHUNK_BYTES];
+    // fill chunk with zeros (black)
+    memset(chunk, 0x00, CHUNK_BYTES);
+
+    size_t remaining = BYTES_TOTAL;
+    while (remaining) {
+        size_t to_send = remaining > CHUNK_BYTES ? CHUNK_BYTES : remaining;
+        // ensure to_send is even (2 bytes per pixel)
+        if (to_send & 1) to_send--;
+        if (to_send == 0) break;
+        send_data(chunk, to_send);
+        remaining -= to_send;
+    }
+}
+
+// Helper: convert 8-bit RGB to RGB565
+static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) 
+{
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+// ST7735 helper: set address window (column/row)
+static void set_address_window(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1) 
+{
+    uint8_t data[4];
+    // CASET
+    send_command(0x2A);
+    data[0] = 0x00; data[1] = x0; data[2] = 0x00; data[3] = x1;
+    send_data(data, 4);
+    // RASET
+    send_command(0x2B);
+    data[0] = 0x00; data[1] = y0; data[2] = 0x00; data[3] = y1;
+    send_data(data, 4);
+    // MEMWR will be issued by caller
+}
+// push repeated color pixels (count pixels, color is RGB565)
+static void push_color_repeat(uint16_t color, size_t count) {
+    // send_data expects bytes; create a small chunk buffer of pairs
+    const size_t CHUNK_PIXELS = 512; // 512 pixels => 1024 bytes (adjust if memory constrained)
+    uint8_t chunk[CHUNK_PIXELS * 2];
+    // fill chunk with color in big-endian (MSB first for ST7735)
+    chunk[0] = (uint8_t)(color >> 8);
+    chunk[1] = (uint8_t)(color & 0xFF);
+    for (size_t i = 1; i < CHUNK_PIXELS; ++i) {
+        chunk[i*2 + 0] = chunk[0];
+        chunk[i*2 + 1] = chunk[1];
+    }
+
+    send_command(0x2C); // memory write
+    size_t remaining = count;
+    while (remaining) {
+        size_t to_pixels = remaining > CHUNK_PIXELS ? CHUNK_PIXELS : remaining;
+        send_data(chunk, to_pixels * 2);
+        remaining -= to_pixels;
+    }
+}
+
+// draw filled rectangle with color
+static void fill_rect(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint16_t color) {
+    if ((x >= TFT_WIDTH) || (y >= TFT_HEIGHT)) return;
+    if (x + w - 1 >= TFT_WIDTH) w = TFT_WIDTH - x;
+    if (y + h - 1 >= TFT_HEIGHT) h = TFT_HEIGHT - y;
+    set_address_window(x, y, x + w - 1, y + h - 1);
+    push_color_repeat(color, (size_t)w * h);
+}
+
+// draw single pixel
+static void draw_pixel(uint8_t x, uint8_t y, uint16_t color) {
+    set_address_window(x, y, x, y);
+    uint8_t b[2] = { (uint8_t)(color >> 8), (uint8_t)(color & 0xFF) };
+    send_command(0x2C);
+    send_data(b, 2);
+}
+
+/* 5x7 font (96 chars: ASCII 32..127)
+   Each character is 5 bytes (columns), LSB top. Standard tiny font.
+   Source: common 5x7 font table.
+*/
+static const uint8_t font5x7[96][5] = {
+    // space (32)
+    {0x00,0x00,0x00,0x00,0x00}, // ' '
+    {0x00,0x00,0x5F,0x00,0x00}, // !
+    {0x00,0x07,0x00,0x07,0x00}, // "
+    {0x14,0x7F,0x14,0x7F,0x14}, // #
+    {0x24,0x2A,0x7F,0x2A,0x12}, // $
+    {0x23,0x13,0x08,0x64,0x62}, // %
+    {0x36,0x49,0x55,0x22,0x50}, // &
+    {0x00,0x05,0x03,0x00,0x00}, // '
+    {0x00,0x1C,0x22,0x41,0x00}, // (
+    {0x00,0x41,0x22,0x1C,0x00}, // )
+    {0x14,0x08,0x3E,0x08,0x14}, // *
+    {0x08,0x08,0x3E,0x08,0x08}, // +
+    {0x00,0x50,0x30,0x00,0x00}, // ,
+    {0x08,0x08,0x08,0x08,0x08}, // -
+    {0x00,0x60,0x60,0x00,0x00}, // .
+    {0x20,0x10,0x08,0x04,0x02}, // /
+    {0x3E,0x51,0x49,0x45,0x3E}, // 0
+    {0x00,0x42,0x7F,0x40,0x00}, // 1
+    {0x72,0x49,0x49,0x49,0x46}, // 2
+    {0x21,0x41,0x49,0x4D,0x33}, // 3
+    {0x18,0x14,0x12,0x7F,0x10}, // 4
+    {0x27,0x45,0x45,0x45,0x39}, // 5
+    {0x3C,0x4A,0x49,0x49,0x30}, // 6
+    {0x01,0x71,0x09,0x05,0x03}, // 7
+    {0x36,0x49,0x49,0x49,0x36}, // 8
+    {0x06,0x49,0x49,0x29,0x1E}, // 9
+    {0x00,0x36,0x36,0x00,0x00}, // :
+    {0x00,0x56,0x36,0x00,0x00}, // ;
+    {0x08,0x14,0x22,0x41,0x00}, // <
+    {0x14,0x14,0x14,0x14,0x14}, // =
+    {0x00,0x41,0x22,0x14,0x08}, // >
+    {0x02,0x01,0x59,0x09,0x06}, // ?
+    {0x3E,0x41,0x5D,0x59,0x4E}, // @
+    {0x7C,0x12,0x11,0x12,0x7C}, // A
+    {0x7F,0x49,0x49,0x49,0x36}, // B
+    {0x3E,0x41,0x41,0x41,0x22}, // C
+    {0x7F,0x41,0x41,0x22,0x1C}, // D
+    {0x7F,0x49,0x49,0x49,0x41}, // E
+    {0x7F,0x09,0x09,0x09,0x01}, // F
+    {0x3E,0x41,0x49,0x49,0x7A}, // G
+    {0x7F,0x08,0x08,0x08,0x7F}, // H
+    {0x00,0x41,0x7F,0x41,0x00}, // I
+    {0x20,0x40,0x41,0x3F,0x01}, // J
+    {0x7F,0x08,0x14,0x22,0x41}, // K
+    {0x7F,0x40,0x40,0x40,0x40}, // L
+    {0x7F,0x02,0x04,0x02,0x7F}, // M
+    {0x7F,0x04,0x08,0x10,0x7F}, // N
+    {0x3E,0x41,0x41,0x41,0x3E}, // O
+    {0x7F,0x09,0x09,0x09,0x06}, // P
+    {0x3E,0x41,0x51,0x21,0x5E}, // Q
+    {0x7F,0x09,0x19,0x29,0x46}, // R
+    {0x46,0x49,0x49,0x49,0x31}, // S
+    {0x01,0x01,0x7F,0x01,0x01}, // T
+    {0x3F,0x40,0x40,0x40,0x3F}, // U
+    {0x1F,0x20,0x40,0x20,0x1F}, // V
+    {0x3F,0x40,0x38,0x40,0x3F}, // W
+    {0x63,0x14,0x08,0x14,0x63}, // X
+    {0x07,0x08,0x70,0x08,0x07}, // Y
+    {0x61,0x51,0x49,0x45,0x43}, // Z
+    {0x00,0x7F,0x41,0x41,0x00}, // [
+    {0x02,0x04,0x08,0x10,0x20}, // backslash
+    {0x00,0x41,0x41,0x7F,0x00}, // ]
+    {0x04,0x02,0x01,0x02,0x04}, // ^
+    {0x40,0x40,0x40,0x40,0x40}, // _
+    {0x00,0x01,0x02,0x04,0x00}, // `
+    {0x20,0x54,0x54,0x54,0x78}, // a
+    {0x7F,0x48,0x44,0x44,0x38}, // b
+    {0x38,0x44,0x44,0x44,0x20}, // c
+    {0x38,0x44,0x44,0x48,0x7F}, // d
+    {0x38,0x54,0x54,0x54,0x18}, // e
+    {0x08,0x7E,0x09,0x01,0x02}, // f
+    {0x0C,0x52,0x52,0x52,0x3E}, // g
+    {0x7F,0x08,0x04,0x04,0x78}, // h
+    {0x00,0x44,0x7D,0x40,0x00}, // i
+    {0x20,0x40,0x44,0x3D,0x00}, // j
+    {0x7F,0x10,0x28,0x44,0x00}, // k
+    {0x00,0x41,0x7F,0x40,0x00}, // l
+    {0x7C,0x04,0x18,0x04,0x78}, // m
+    {0x7C,0x08,0x04,0x04,0x78}, // n
+    {0x38,0x44,0x44,0x44,0x38}, // o
+    {0x7C,0x14,0x14,0x14,0x08}, // p
+    {0x08,0x14,0x14,0x18,0x7C}, // q
+    {0x7C,0x08,0x04,0x04,0x08}, // r
+    {0x48,0x54,0x54,0x54,0x20}, // s
+    {0x04,0x3F,0x44,0x40,0x20}, // t
+    {0x3C,0x40,0x40,0x20,0x7C}, // u
+    {0x1C,0x20,0x40,0x20,0x1C}, // v
+    {0x3C,0x40,0x30,0x40,0x3C}, // w
+    {0x44,0x28,0x10,0x28,0x44}, // x
+    {0x0C,0x50,0x50,0x50,0x3C}, // y
+    {0x44,0x64,0x54,0x4C,0x44}, // z
+    {0x00,0x08,0x36,0x41,0x00}, // {
+    {0x00,0x00,0x7F,0x00,0x00}, // |
+    {0x00,0x41,0x36,0x08,0x00}, // }
+    {0x10,0x08,0x08,0x10,0x08}, // ~
+};
+
+// draw a character (foreground color on background color)
+static void draw_char(uint8_t x, uint8_t y, char c, uint16_t fg, uint16_t bg) {
+    if (c < 32 || c > 127) c = '?';
+    const uint8_t *ch = font5x7[c - 32];
+    // each char is 5x7, we'll add 1 column spacing
+    // draw background rectangle for char (6x8)
+    fill_rect(x, y, 6, 8, bg);
+
+    for (uint8_t col = 0; col < 5; ++col) {
+        uint8_t colbits = ch[col];
+        for (uint8_t row = 0; row < 7; ++row) {
+            if (colbits & (1 << row)) {
+                draw_pixel(x + col, y + row, fg);
+            }
+        }
+    }
+}
+
+// draw a text string (left-to-right)
+static void draw_text(uint8_t x, uint8_t y, const char *s, uint16_t fg, uint16_t bg) {
+    while (*s) {
+        draw_char(x, y, *s, fg, bg);
+        x += 6 + FONT_SPACING;
+        ++s;
+    }
+}
+
+// small heart bitmap (12x12) precomputed in RGB565 (MSB,LSB pairs).
+// This is a 12x12 red heart shape; transparent pixels encoded as 0x0000 (black).
+static const uint16_t heart12[12*12] = {
+    // row-major 12x12; 0xF800 for red, 0x0000 for transparent
+    // handcrafted pattern
+    0x0000,0x0000,0x0000,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,0x0000,0x0000,0x0000,
+    0x0000,0x0000,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,0x0000,0x0000,
+    0x0000,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,0x0000,
+    0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,
+    0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,
+    0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,
+    0x0000,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,0x0000,
+    0x0000,0x0000,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,0x0000,0x0000,
+    0x0000,0x0000,0x0000,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,0x0000,0x0000,0x0000,
+    0x0000,0x0000,0x0000,0x0000,0xF800,0xF800,0xF800,0x0000,0x0000,0x0000,0x0000,0x0000,
+    0x0000,0x0000,0x0000,0x0000,0x0000,0xF800,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,
+    0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000
+};
+
+// draw a small bitmap (16-bit per pixel array)
+static void draw_bitmap_rgb565(uint8_t x, uint8_t y, const uint16_t *bmp, uint8_t w, uint8_t h, uint16_t bg)
+{
+    // fill background rect first
+    fill_rect(x, y, w, h, bg);
+    // then draw pixels
+    for (uint8_t row = 0; row < h; ++row) {
+        for (uint8_t col = 0; col < w; ++col) {
+            uint16_t p = bmp[row * w + col];
+            if (p != 0x0000) { // treat 0x0000 as transparent/skip (if you want black use other pattern)
+                draw_pixel(x + col, y + row, p);
+            }
+        }
+    }
+}
+
+// Example: format float voltage (V) into string buffer ("3.30V")
+static void format_voltage_str(char *buf, size_t buf_len, float volts)
+{
+    // ensure one decimal or two decimals as desired
+    // we'll print with 2 decimals
+    snprintf(buf, buf_len, "%.2fV", volts);
+}
+
+// Clear entire screen to bg color
+static void clear_screen(uint16_t bg_color)
+{
+    fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, bg_color);
+}
+
+// Compose and update the fields: battery, version, center counter, heart state
+static void update_display(uint16_t discovery_count, float batt_voltage)
+{
+    // colors
+    uint16_t black = rgb565(0,0,0);
+    uint16_t white = rgb565(255,255,255);
+    uint16_t red   = rgb565(255,0,0);
+
+    // clear entire screen black (or do partial updates if you prefer)
+    clear_screen(black);
+
+    // top-right: battery voltage and version (stacked)
+    char volt_buf[16];
+    format_voltage_str(volt_buf, sizeof(volt_buf), batt_voltage);
+
+    // Decide where to place strings so they are right-justified
+    // text width = (6 + FONT_SPACING)*chars - FONT_SPACING -> simpler compute per char 6
+    size_t volt_len = strlen(volt_buf);
+    //size_t ver_len  = strlen(APP_VERSION);
+    int volt_w = (int)volt_len * (6 + FONT_SPACING);
+    //int ver_w  = (int)ver_len  * (6 + FONT_SPACING);
+
+    int x_volt = TFT_WIDTH - volt_w - RIGHT_MARGIN;
+    //int x_ver  = TFT_WIDTH - ver_w - RIGHT_MARGIN;
+    int y_volt = TOP_MARGIN;
+    //int y_ver  = TOP_MARGIN + 8 + 2; // below voltage (8 px high font + small gap)
+
+    draw_text((uint8_t)x_volt, (uint8_t)y_volt, volt_buf, white, black);
+    //draw_text((uint8_t)x_ver,  (uint8_t)y_ver,  APP_VERSION, white, black);
+
+    // center: "Discovery: N"
+    char center_buf[32];
+    snprintf(center_buf, sizeof(center_buf), "Discovery:%u", discovery_count);
+    int center_len = strlen(center_buf);
+    int cx = (TFT_WIDTH - center_len * (6 + FONT_SPACING)) / 2;
+    int cy = (TFT_HEIGHT - 8) / 2 - 8; // a little above center
+    if (cx < 0) cx = 0;
+    draw_text((uint8_t)cx, (uint8_t)cy, center_buf, white, black);
+}
+
+#endif
+
+#ifdef USE_INA219_SENSOR
+static bool setup_i2c_bus(void)
+{
+    //Setup the i2c bus and return true if OK.
+    return true;
+}
+
+// TODO: Implement INA219 sensor stuff here.
+
+#endif
 static void setup_radio_monitor(void)
 {
     if (debug)
@@ -365,13 +931,104 @@ static void setup_mac_radiotap(void)
     memset(wpr_data_tx.fec, 0x00, sizeof(wpr_data_tx.fec));
 }
 
-static void codec2_timeout_check(void)
+static void fatal(const char *msg, int err) {
+    if (err)
+        fprintf(stderr, "%s: %s\n", msg, snd_strerror(err));
+    else
+        fprintf(stderr, "%s\n", msg);
+    cleanup();
+}
+
+static snd_pcm_t *try_open_pcm_device(const char *device) {
+    snd_pcm_t *pcm = NULL;
+    int err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK, 0);
+    if (err < 0) {
+        return NULL;
+    }
+    return pcm;
+}
+
+static snd_pcm_t *open_pcm_sndcard(void) {
+    snd_pcm_t *pcm = NULL;
+    int err;
+
+    pcm = try_open_pcm_device("default");
+    if (pcm) return pcm;
+
+    int card = -1;
+    if ((err = snd_card_next(&card)) < 0) {
+        fprintf(stderr, "snd_card_next error: %s\n", snd_strerror(err));
+        return NULL;
+    }
+
+    while (card >= 0) {
+        char dev[64];
+
+        // try plughw:card,0 first (allows automatic conversion)
+        snprintf(dev, sizeof(dev), "plughw:%d,0", card);
+        pcm = try_open_pcm_device(dev);
+        if (pcm) return pcm;
+
+        // try hw:card,0
+        snprintf(dev, sizeof(dev), "hw:%d,0", card);
+        pcm = try_open_pcm_device(dev);
+        if (pcm) return pcm;
+
+        // next card
+        if ((err = snd_card_next(&card)) < 0) {
+            fprintf(stderr, "snd_card_next error: %s\n", snd_strerror(err));
+            break;
+        }
+    }
+
+    // nothing found
+    return NULL;
+}
+
+static void set_hw_params(snd_pcm_t *pcm, unsigned int sample_rate, int channels, snd_pcm_format_t format) {
+    snd_pcm_hw_params_t *hw;
+    int err;
+
+    snd_pcm_hw_params_malloc(&hw);
+    snd_pcm_hw_params_any(pcm, hw);
+
+    err = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+    if (err < 0) fatal("Failed to set access", err);
+
+    err = snd_pcm_hw_params_set_format(pcm, hw, format);
+    if (err < 0) fatal("Failed to set format", err);
+
+    err = snd_pcm_hw_params_set_channels(pcm, hw, channels);
+    if (err < 0) fatal("Failed to set channels", err);
+
+    unsigned int rate = sample_rate;
+    err = snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, 0);
+    if (err < 0) fatal("Failed to set rate", err);
+    if (rate != sample_rate) {
+        fprintf(stderr, "Requested sample rate %u, got %u\n", sample_rate, rate);
+    }
+
+    snd_pcm_uframes_t period = PERIOD_FRAMES;
+    snd_pcm_uframes_t buffer = BUFFER_FRAMES;
+    err = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, 0);
+    if (err < 0) fatal("Failed to set period size", err);
+
+    err = snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer);
+    if (err < 0) fatal("Failed to set buffer size", err);
+
+    err = snd_pcm_hw_params(pcm, hw);
+    if (err < 0) fatal("Failed to apply HW params", err);
+
+    snd_pcm_hw_params_free(hw);
+}
+
+static void audio_channel_timeout_check(void)
 {
-    uint64_t t = now_ns();
+    uint64_t t = now_us();
 
     for (int i = 0; i < 4; i++)
     {
-        if (channels[i].active && (t - channels[i].last_rx_ns) > 300000000ULL)
+        if (channels[i].active && (t - channels[i].last_rx_us) > (ONE_MS_IN_US * 100))
         {
             printf("Channel %d: timeout\n", i);
             channels[i].active = 0;
@@ -464,6 +1121,16 @@ static void setup_radio(void)
 
     if (debug)
     {
+        printf("Setting radio_fd nonblock...\n");
+    }
+
+    if (set_fd_nonblocking(radio_fd) != 0) {
+        close(radio_fd);
+        cleanup();
+    }
+
+    if (debug)
+    {
         printf("Binding to radio_fd...\n");
     }
 
@@ -476,116 +1143,102 @@ static void setup_radio(void)
 
     if (isRadioReceiving)
     {
-        if (usePcapForRx)
+        printf("Setting up pcap...\n");
+        char errbuf[PCAP_ERRBUF_SIZE];
+
+        pcap_handle = pcap_create(RADIO_IFACE, errbuf);
+        if (pcap_handle == NULL)
         {
-            printf("Setting up pcap...\n");
-            char errbuf[PCAP_ERRBUF_SIZE];
-
-            pcap_handle = pcap_create(RADIO_IFACE, errbuf);
-            if (pcap_handle == NULL)
-            {
-                fprintf(stderr, "pcap_create failed: %s\n", errbuf);
-                cleanup();
-            }
-
-            if (FRAME_SIZE > 0 && pcap_set_buffer_size(pcap_handle, FRAME_SIZE) != 0)
-            {
-                printf("set_buffer_size failed");
-                cleanup();
-            }
-            if (pcap_set_snaplen(pcap_handle, 4096) != 0)
-            {
-                printf("set_snaplen failed");
-                cleanup();
-            }
-            if (pcap_set_promisc(pcap_handle, 1) != 0)
-            {
-                printf("set_promisc failed");
-                cleanup();
-            }
-            if (pcap_set_timeout(pcap_handle, -1) != 0)
-            {
-                printf("set_timeout failed");
-                cleanup();
-            }
-            if (pcap_set_immediate_mode(pcap_handle, 1) != 0)
-            {
-                printf("pcap_set_immediate_mode failed: %s", pcap_geterr(pcap_handle));
-                cleanup();
-            }
-            if (pcap_activate(pcap_handle) != 0)
-            {
-                printf("pcap_activate failed: %s", pcap_geterr(pcap_handle));
-                cleanup();
-            }
-            if (pcap_setnonblock(pcap_handle, 1, errbuf) != 0)
-            {
-                printf("set_nonblock failed: %s", errbuf);
-                cleanup();
-            }
-
-            int link_encap = pcap_datalink(pcap_handle);
-            struct bpf_program bpfprogram;
-
-            if (link_encap != DLT_IEEE802_11_RADIO)
-            {
-                printf("unknown encapsulation on %s", RADIO_IFACE);
-                cleanup();
-            }
-
-            // const char *program = "ether[0x0a:2]==0x5742 && ether[0x0c:4] == 0x00000001";
-            const char *program = "ether[0x0a:2]==0x5742"; // TODO filter out other packets. (using ff:ff:ff:ff:ff:ff as addr1 and our own MAC as addr3)
-
-            if (pcap_compile(pcap_handle, &bpfprogram, program, 1, 0) == -1)
-            {
-                printf("Unable to compile %s: %s", program, pcap_geterr(pcap_handle));
-                cleanup();
-            }
-
-            if (pcap_setfilter(pcap_handle, &bpfprogram) == -1)
-            {
-                printf("Unable to set filter %s: %s", program, pcap_geterr(pcap_handle));
-                cleanup();
-            }
-
-            pcap_freecode(&bpfprogram);
-            pcap_fd = pcap_get_selectable_fd(pcap_handle);
-
-            if (pcap_fd < 0)
-            {
-                printf("Unable to obtain pcap FD...");
-                cleanup();
-            }
+            fprintf(stderr, "pcap_create failed: %s\n", errbuf);
+            cleanup();
         }
-        else
+
+        if (FRAME_SIZE > 0 && pcap_set_buffer_size(pcap_handle, FRAME_SIZE) != 0)
         {
-            printf("Setting up ringbuffer and not using pcap\n");
-            struct tpacket_req req = {
-                .tp_block_size = BLOCK_SIZE,
-                .tp_frame_size = FRAME_SIZE,
-                .tp_block_nr = BLOCK_NR,
-            };
+            printf("set_buffer_size failed");
+            cleanup();
+        }
+        if (pcap_set_snaplen(pcap_handle, 4096) != 0)
+        {
+            printf("set_snaplen failed");
+            cleanup();
+        }
+        if (pcap_set_promisc(pcap_handle, 1) != 0)
+        {
+            printf("set_promisc failed");
+            cleanup();
+        }
+        if (pcap_set_timeout(pcap_handle, -1) != 0)
+        {
+            printf("set_timeout failed");
+            cleanup();
+        }
+        if (pcap_set_immediate_mode(pcap_handle, 1) != 0)
+        {
+            printf("pcap_set_immediate_mode failed: %s", pcap_geterr(pcap_handle));
+            cleanup();
+        }
+        if (pcap_activate(pcap_handle) != 0)
+        {
+            printf("pcap_activate failed: %s", pcap_geterr(pcap_handle));
+            cleanup();
+        }
+        if (pcap_setnonblock(pcap_handle, 1, errbuf) != 0)
+        {
+            printf("set_nonblock failed: %s", errbuf);
+            cleanup();
+        }
 
-            req.tp_frame_nr = (req.tp_block_size * req.tp_block_nr) / req.tp_frame_size;
+        int link_encap = pcap_datalink(pcap_handle);
+        struct bpf_program bpfprogram;
 
-            if (setsockopt(radio_fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)) < 0)
-            {
-                perror("PACKET_RX_RING");
-                cleanup();
-            }
+        if (link_encap != DLT_IEEE802_11_RADIO)
+        {
+            printf("unknown encapsulation on %s", RADIO_IFACE);
+            cleanup();
+        }
 
-            ring_size = req.tp_block_size * req.tp_block_nr;
-            frame_nr = req.tp_frame_nr;
+        // const char *program = "ether[0x0a:2]==0x5742 && ether[0x0c:4] == 0x00000001";
+        const char *program = "ether[0x0a:2]==0x5742"; // TODO filter out other packets. (using ff:ff:ff:ff:ff:ff as addr1 and our own MAC as addr3)
 
-            ring = mmap(NULL, ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, radio_fd, 0);
+        if (pcap_compile(pcap_handle, &bpfprogram, program, 1, 0) == -1)
+        {
+            printf("Unable to compile %s: %s", program, pcap_geterr(pcap_handle));
+            cleanup();
+        }
 
-            if (ring == MAP_FAILED)
-            {
-                perror("mmap");
-                cleanup();
-            }
+        if (pcap_setfilter(pcap_handle, &bpfprogram) == -1)
+        {
+            printf("Unable to set filter %s: %s", program, pcap_geterr(pcap_handle));
+            cleanup();
+        }
+
+        pcap_freecode(&bpfprogram);
+        pcap_fd = pcap_get_selectable_fd(pcap_handle);
+
+        if (pcap_fd < 0)
+        {
+            printf("Unable to obtain pcap FD...");
+            cleanup();
         }
     }
+}
+
+static bool add_to_tx_queue(struct wpr_data *pkt)
+{
+    if (!wpr_enqueue(pkt))
+    {
+        printf("Buffer full, dropping oldest packet...\n");
+        // queue full -- handle overflow (drop, log, or backoff)
+        // pop oldest
+        tx_queue.head = (tx_queue.head + 1) % WPR_TX_QUEUE_SZ;
+        tx_queue.len--;
+        // push new
+        memcpy(&tx_queue.items[tx_queue.tail], &pkt, sizeof(struct wpr_data));
+        tx_queue.tail = (tx_queue.tail + 1) % WPR_TX_QUEUE_SZ;
+        tx_queue.len++;
+    }
+    return true;
 }
 
 static uint64_t send_radio_data(struct wpr_data *pkt_data, size_t pkt_len)
@@ -630,7 +1283,7 @@ static uint64_t send_radio_data(struct wpr_data *pkt_data, size_t pkt_len)
 
     if (radio_fd < 0)
     {
-        printf(stderr, "send_radio_data: radio_fd not open, aborting send\n");
+        fprintf(stderr, "send_radio_data: radio_fd not open, aborting send\n");
         free(frameDataTX);
         return (uint64_t)-1;
     }
@@ -659,6 +1312,21 @@ static uint64_t send_radio_data(struct wpr_data *pkt_data, size_t pkt_len)
     return sret;
 }
 
+static void send_radio_tx_queue(void)
+{
+    struct wpr_data pkt;
+    // Dequeue and send until empty or until you hit a sending quota (not imposed here)
+    while (wpr_dequeue(&pkt))
+    {
+        // send_radio_data copies the data as you described (user-supplied)
+        // Note: send_radio_data may block or take time — consider doing this outside critical sections.
+        if ((uint64_t)send_radio_data(&pkt, sizeof(pkt)) < 0)
+        {
+            fprintf(stderr, "send_radio_tx_queue: radio send failed.\n");
+        }
+    }
+}
+
 static void decode_codec2_voice_data(const uint8_t *voice, size_t voice_len)
 {
     if (codec2 == NULL)
@@ -668,7 +1336,7 @@ static void decode_codec2_voice_data(const uint8_t *voice, size_t voice_len)
     }
 
     ssize_t nsamples = codec2_samples_per_frame(codec2); // For CODEC2_MODE_3200, it is 160 samples.
-    size_t pcm_bytes = (size_t)nsamples * sizeof(int16_t);
+    //size_t pcm_bytes = (size_t)nsamples * sizeof(int16_t);
 
     if (voice_len == 0)
         return;
@@ -679,17 +1347,116 @@ static void decode_codec2_voice_data(const uint8_t *voice, size_t voice_len)
 
     codec2_decode(codec2, pcm, voice);
 
-    if (audio_out_fd > 0)
+    if (soundCardFound)
     {
-        ssize_t w = write(audio_out_fd, pcm, pcm_bytes);
-        if (w < 0)
-            perror("write audio");
-        else if ((size_t)w != pcm_bytes)
-            fprintf(stderr, "Short audio write (%zd/%zu)\n", w, pcm_bytes);
+        if (pcmDevice) {
+            snd_pcm_sframes_t frames = nsamples; /* nsamples is frames for mono interleaved int16 */
+            snd_pcm_sframes_t written = snd_pcm_writei(pcmDevice, pcm, frames);
+
+            if (written == -EPIPE) {
+                /* underrun */
+                fprintf(stderr, "ALSA underrun: preparing device\n");
+                int err = snd_pcm_prepare(pcmDevice);
+                if (err < 0) {
+                    fprintf(stderr, "snd_pcm_prepare failed: %s\n", snd_strerror(err));
+                    /* optionally fall back to socket or return */
+                } else {
+                    /* try writing again once */
+                    written = snd_pcm_writei(pcmDevice, pcm, frames);
+                }
+            } 
+            else if (written == -ESTRPIPE)
+            {
+                /* suspended; try resume */
+                while ((written = snd_pcm_resume(pcmDevice)) == -EAGAIN) sleep(1);
+                if (written < 0) {
+                    int err = snd_pcm_prepare(pcmDevice);
+                    if (err < 0) {
+                        fprintf(stderr, "snd_pcm_prepare after resume failed: %s\n", snd_strerror(err));
+                    } else {
+                        written = snd_pcm_writei(pcmDevice, pcm, frames);
+                    }
+                } else {
+                    /* resumed: try writing */
+                    written = snd_pcm_writei(pcmDevice, pcm, frames);
+                }
+            }
+
+            if (written < 0) {
+                int err = snd_pcm_recover(pcmDevice, written, 1);
+                if (err < 0) {
+                    fprintf(stderr, "ALSA write failed and recover failed: %s\n", snd_strerror(err));
+                }
+            } 
+            else if (written != frames) 
+            {
+                fprintf(stderr, "ALSA short write: wrote %ld of %ld frames\n", (long)written, (long)frames);
+                /* partial write handling: advance buffer and write remaining frames (rare with proper buffering) */
+                snd_pcm_sframes_t remaining = frames - written;
+                int16_t *ptr = pcm + written;
+                while (remaining > 0) {
+                    snd_pcm_sframes_t w2 = snd_pcm_writei(pcmDevice, ptr, remaining);
+                    if (w2 < 0) {
+                        int err = snd_pcm_recover(pcmDevice, w2, 1);
+                        if (err < 0) {
+                            fprintf(stderr, "ALSA write/recover failed during remainder: %s\n", snd_strerror(err));
+                            break;
+                        }
+                        continue;
+                    }
+                    remaining -= w2;
+                    ptr += w2;
+                }
+            }
+        }else{
+            fprintf(stderr, "No PCM audio device found!");
+            return;
+        }
     }
 }
 
-static void process_wpr_data_rx()
+static void send_discovery_ping(){
+    struct wpr_mesh mesh_tx;
+    memset(mesh_tx.dst, 0xFF, 6);
+    mesh_tx.msgtype = RADIO_DATA_MESH_MSG_DISCOVERY_PING;
+    uint64_t t = now_us();
+    memcpy(mesh_tx.msg, &t, sizeof(t));
+
+    //Construct and send this message...
+    struct wpr_data wpr_send_ping;
+
+    wpr_send_ping.data_type = RADIO_DATA_MESH;
+    wpr_send_ping.magic_header = DATA_HDR_MAGIC;
+    memcpy(wpr_send_ping.data, &mesh_tx, sizeof(mesh_tx));
+    
+    if (!add_to_tx_queue(&wpr_send_ping))
+    {
+        fprintf(stderr, "send_discovery_ping: radio tx message enqueue failed.\n");
+    }
+}
+
+static void send_discovery_pong(uint8_t addr[6]){
+    //Construct the discovery ping message to send..
+    struct wpr_mesh mesh_tx_pong;
+    memcpy(mesh_tx_pong.dst, &addr, 6);
+    mesh_tx_pong.msgtype = RADIO_DATA_MESH_MSG_DISCOVERY_PONG;
+    uint64_t t = now_us();
+    memcpy(mesh_tx_pong.msg, &t, sizeof(t));
+
+    //Construct and send this message...
+    struct wpr_data wpr_send_pong;
+
+    wpr_send_pong.data_type = RADIO_DATA_MESH;
+    wpr_send_pong.magic_header = DATA_HDR_MAGIC;
+    memcpy(wpr_send_pong.data, &mesh_tx_pong, sizeof(mesh_tx_pong));
+    
+    if (!add_to_tx_queue(&wpr_send_pong))
+    {
+        fprintf(stderr, "send_discovery_pong: radio tx message enqueue failed.\n");
+    }
+}
+
+static void process_wpr_data_rx(uint8_t srcAddr[6], uint8_t ant1, uint8_t ant2)
 {
     uint8_t data_type = wpr_data_rx.data_type;
 
@@ -697,19 +1464,18 @@ static void process_wpr_data_rx()
 
     switch (data_type)
     {
-    case RADIO_DATA_NOOP:
-        return;
-        break;
-    case RADIO_DATA_AUDIO:
-        goto process_wpr_audio;
-        break;
-    case RADIO_DATA_MESH:
-        printf("RADIO_DATA_MESH message not implemented yet.\n");
-        return;
-        break;
-    default:
-        return;
-        break;
+        case RADIO_DATA_NOOP:
+            return;
+            break;
+        case RADIO_DATA_AUDIO:
+            goto process_wpr_audio;
+            break;
+        case RADIO_DATA_MESH:
+            goto process_wpr_mesh;
+            break;
+        default:
+            return;
+            break;
     }
 
 process_wpr_audio:
@@ -740,7 +1506,7 @@ process_wpr_audio:
                 printf("Channel %u: PTT start\n", channel);
                 ch->active = 1;
             }
-            ch->last_rx_ns = now_ns();
+            ch->last_rx_us = now_us();
 
             uint8_t *audio_ptr = (uint8_t *)malloc(audio_len);
             memcpy(audio_ptr, wpr_data_rx.data + 2, audio_len);
@@ -761,12 +1527,52 @@ process_wpr_audio:
         printf("Ignoring channel ID: %u", channel);
         return;
     }
+
+process_wpr_mesh:
+    struct wpr_mesh mesh_data;
+
+    memcpy(&mesh_data, wpr_data_rx.data, sizeof(struct wpr_mesh));
+
+    uint8_t mesh_command = mesh_data.msgtype;
+
+    switch (mesh_command)
+    {
+        //We got a discovery ping message, send a pong message.
+    case RADIO_DATA_MESH_MSG_DISCOVERY_PING:
+        if (discoveryFrameCounter == 65534)
+        {
+            discoveryFrameCounter = 0;
+        }
+        else
+        {
+            discoveryFrameCounter++;
+        }
+
+        printf("Ping message from: %s, Ant-1: %d dBm, Ant-2: %d dBm\n", mac_to_string(srcAddr), ant1, ant2);
+        send_discovery_pong(srcAddr);
+        break;
+    case RADIO_DATA_MESH_MSG_DISCOVERY_PONG:
+        //We got a response from the other side, use the time.
+        printf("Pong message from: %s, Ant-1: %d dBm, Ant-2: %d dBm\n", mac_to_string(srcAddr), ant1, ant2);
+        break;
+    case RADIO_DATA_MESH_MSG_FORWARD_AUDIO:
+        printf("Feature not available yet.\n");
+        return;
+    default:
+        printf("Unknown mesh radio command: %u\n", mesh_command);
+        return;
+    }
 }
 
-static void parse_radio_message(const uint8_t *pkt, size_t len, const struct pcap_pkthdr *pcaphdr)
+static void parse_radio_message(const uint8_t *pkt, size_t len)
+//static void parse_radio_message(const uint8_t *pkt, size_t len, const struct pcap_pkthdr *pcaphdr)
 {
+    uint8_t antIndex = 0;
+    uint8_t ant1dBm = 0;
+    uint8_t ant2dBm = 0;
+
     // TODO: Implement FCS data framing
-    //  Start to decode the ieee80211_radiotap_header data
+    // Start to decode the ieee80211_radiotap_header data
     struct ieee80211_radiotap_header *rt_hdr = (struct ieee80211_radiotap_header *)pkt;
 
     if (len < sizeof(*rt_hdr))
@@ -797,12 +1603,6 @@ static void parse_radio_message(const uint8_t *pkt, size_t len, const struct pca
     struct ieee80211_radiotap_iterator it;
     if (ieee80211_radiotap_iterator_init(&it, rt_hdr, rt_hdr_len, NULL) < 0)
     {
-        // printf("ieee80211_radiotap_iterator_init(&it, rt_hdr, rt_hdr_len, NULL) < 0\n");
-        // //print the data
-        // fprintf(stderr, "TX: send_test_tone payload_len=%u data:", len);
-        // for (size_t i = 0; i < (size_t)len; ++i)
-        //     fprintf(stderr, " %02x", pkt[i]);
-        // fprintf(stderr, "\n");
         return;
     }
 
@@ -903,9 +1703,21 @@ static void parse_radio_message(const uint8_t *pkt, size_t len, const struct pca
                 }
                 break;
             case IEEE80211_RADIOTAP_DBM_ANTSIGNAL:
-            case IEEE80211_RADIOTAP_DBM_ANTNOISE:
+                {
+                    if (antIndex == 0){
+                        ant1dBm = *(int8_t *)it.this_arg;
+                    }else{
+                        ant2dBm = *(int8_t *)it.this_arg;
+                    }
+                }
+                break;
             case IEEE80211_RADIOTAP_ANTENNA:
-            case IEEE80211_RADIOTAP_RX_FLAGS:
+                {
+                    antIndex++;
+                }
+                break;
+            //case IEEE80211_RADIOTAP_RX_FLAGS:
+            //case IEEE80211_RADIOTAP_DBM_ANTNOISE:
             default:
                 break;
             }
@@ -1015,7 +1827,7 @@ static void parse_radio_message(const uint8_t *pkt, size_t len, const struct pca
     // }
 
     memcpy(&wpr_data_rx, body_start, sizeof(struct wpr_data));
-    process_wpr_data_rx();
+    process_wpr_data_rx(mac_hdr->addr3, ant1dBm, ant2dBm);
 }
 
 static void gen_tone(int16_t *pcm, int n)
@@ -1031,91 +1843,6 @@ static void gen_tone(int16_t *pcm, int n)
     }
 }
 
-static int send_wav(const char *filename)
-{
-    if (debug)
-    {
-        printf("Sending WAV file...\n");
-    }
-
-    if (codec2 == NULL)
-    {
-        fprintf(stderr, "Codec2 not initialized (send_wav)\n");
-        return -1;
-    }
-
-    // Prepare the wpr_data_tx struct
-    wpr_data_tx.data_type = RADIO_DATA_AUDIO;
-    wpr_data_tx.data[1] = 1; // PTT is ON
-
-    wavFile = fopen(filename, "rb");
-    if (!wavFile)
-    {
-        perror("Cannot open WAV file");
-        return -1;
-    }
-
-    // Skip standard 44-byte WAV header (very simple – assumes canonical format)
-    uint8_t header[44];
-    if (fread(header, 1, 44, wavFile) != 44)
-    {
-        fprintf(stderr, "WAV file too short\n");
-        return -1;
-    }
-
-    // Very basic sanity check
-    if (strncmp((char *)header, "RIFF", 4) != 0 || strncmp((char *)(header + 8), "WAVE", 4) != 0)
-    {
-        fprintf(stderr, "Not a valid WAV file\n");
-        return -1;
-    }
-
-    printf("Transmitting WAV file: %s  (mono 8kHz 16-bit PCM)\n", filename);
-    int codec2_encoded_bytecount = codec2_bytes_per_frame(codec2);   // 160 samples for MODE_2400, 160 samples for MODE_3200
-    int codec2_decoded_bytecount = codec2_samples_per_frame(codec2); // 6 bytes for MODE_2400, 8 bytes for MODE_3200
-
-    int16_t pcm_in[codec2_decoded_bytecount];
-    uint8_t codec2_out[codec2_encoded_bytecount];
-
-    int total_frames = 0;
-
-    while (running)
-    {
-        size_t read_samples = fread(pcm_in, sizeof(int16_t), codec2_decoded_bytecount, wavFile);
-        if (read_samples == 0)
-            break; // EOF
-
-        // Pad with silence if partial last frame
-        if (read_samples < (size_t)codec2_decoded_bytecount)
-        {
-            memset(pcm_in + read_samples, 0, (codec2_decoded_bytecount - read_samples) * sizeof(int16_t));
-        }
-
-        codec2_encode(codec2, codec2_out, pcm_in);
-
-        memcpy(wpr_data_tx.data + 2, codec2_out, (size_t)codec2_encoded_bytecount);
-
-        if ((int64_t)send_radio_data(&wpr_data_tx, sizeof(wpr_data_tx)) < 0)
-        {
-            fprintf(stderr, "send_wav: radio send failed, stopping transmitter loop\n");
-            cleanup();
-            break;
-        }
-
-        total_frames++;
-        usleep(20000);
-
-        if (!running)
-        {
-            printf("Interrupted, stopping WAV transmission...\n");
-            break;
-        }
-    }
-
-    printf("Finished transmitting WAV (%d frames sent)\n", total_frames);
-    return 0;
-}
-
 static void send_test_tone(void)
 {
     if (debug)
@@ -1125,7 +1852,7 @@ static void send_test_tone(void)
 
     if (codec2 == NULL)
     {
-        fprintf(stderr, "Codec2 not initialized (send_wav)\n");
+        fprintf(stderr, "Codec2 not initialized (send_test_tone)\n");
         cleanup();
     }
 
@@ -1154,6 +1881,9 @@ static void send_test_tone(void)
 
         // Advance read index and wrap
         toneIdx = (toneIdx + codec2_decoded_bytecount) % TEST_TONE_INTERVAL;
+        if (toneIdx == 0){
+            break;
+        }
 
         // Copy 160 bytes of PCM data, and encode to codec bits (6 or 8 bytes depending on mode) to send it.
         codec2_encode(codec2, codec2_out, pcm_in);
@@ -1191,39 +1921,6 @@ static void send_test_tone(void)
     }
 }
 
-static int setup_audio_socket(void)
-{
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0)
-    {
-        perror("socket");
-        cleanup();
-    }
-
-    int one = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(3443),
-        .sin_addr.s_addr = INADDR_ANY,
-    };
-
-    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-    {
-        perror("bind");
-        cleanup();
-    }
-
-    if (listen(s, 1) < 0)
-    {
-        perror("listen");
-        cleanup();
-    }
-
-    return s;
-}
-
 static void detect_phy(const char *phy)
 {
     char path[256];
@@ -1242,8 +1939,6 @@ static void printParameters(void)
 
 static void do_main_loop(int argc, char *argv[])
 {
-    char *wav;
-
     if (argc == 0)
     {
         printf("No parameters specified. Aborting!\n");
@@ -1260,10 +1955,16 @@ static void do_main_loop(int argc, char *argv[])
             if (strcmp(argv[1], "tx") == 0)
             {
                 isRadioTransmitting = true;
+
             }
             else if (strcmp(argv[1], "rx") == 0)
             {
                 isRadioReceiving = true;
+            }
+            else if (strcmp(argv[1], "rxtx") == 0 || strcmp(argv[1], "txrx") == 0)
+            {
+                isRadioReceiving = true;
+                isRadioTransmitting = true;
             }
             else
             {
@@ -1271,35 +1972,11 @@ static void do_main_loop(int argc, char *argv[])
                 cleanup();
             }
         }
-
-        if (argc == 3)
+        else
         {
-
-            printf("argc == 3\n");
-
-            if (strcmp(argv[1], "rx") == 0)
-            {
-                printf("One cannot receive while transmitting audio, just yet.\n");
-                cleanup();
-            }
-            else if (strcmp(argv[1], "tx") == 0)
-            {
-                isRadioTransmitting = true;
-            }
-            else
-            {
-                printf("Unknown parameter, aborting.\n");
-                cleanup();
-            }
-
-            wav = argv[2];
+            printf("Unknown count of parameters, aborting\n");
+            cleanup();
         }
-    }
-
-    if (isRadioTransmitting && isRadioReceiving)
-    {
-        printf("One cannot transmit and receive just yet!");
-        cleanup();
     }
 
     setup_radio();
@@ -1319,27 +1996,28 @@ static void do_main_loop(int argc, char *argv[])
         //     cleanup();
         // }
 
-        tcp_listen = setup_audio_socket();
+        //Not using a PCM sound card device for now, just want to TX/RX mesh data for testing purposes.
+        // pcmDevice = open_pcm_sndcard();
+        // if (pcmDevice != NULL){
+        //     printf("Found PCM device, configuring...\n");
+        //     set_hw_params(pcmDevice, SAMPLE_RATE, CHANNELS, FORMAT);
 
-        while (audio_out_fd <= 0 && running)
-        {
-            printf("Waiting for audio client to connect on port 3443...\n");
-            audio_out_fd = accept(tcp_listen, NULL, NULL);
-            if (audio_out_fd <= 0)
-            {
-                perror("accept");
-                sleep(1);
-                cleanup();
-            }
-        }
+        //     int bytes_per_frame = snd_pcm_format_width(FORMAT) / 8 * CHANNELS;
+        //     if (bytes_per_frame <= 0) fatal("Invalid format width", 0);
 
-        if (audio_out_fd > 0 && running)
-        {
-            printf("Audio client connected...\n");
-        }
+        //     printf("PCM audio out device configured...\n");
+        //     soundCardFound = true;
+        // }else{
+        //     printf("Unable to find a soundcard device...\n");
+        //     soundCardFound = false;
+        // }
     }
 
     unsigned int frame = 0;
+    
+    uint64_t now_in_us = 0;
+    uint64_t refreshDisplayTime = 0;
+    uint64_t discoverySend = 0;
 
     if (codec2 == NULL)
     {
@@ -1347,69 +2025,89 @@ static void do_main_loop(int argc, char *argv[])
         cleanup();
     }
 
+    printf("Starting application loop...\n");
+
     while (running)
     {
+        now_in_us = now_us();
+
+#ifdef SPI_DISPLAY_ENABLED
+        if (usingDisplay){
+            if (now_in_us - refreshDisplayTime > (ONE_MS_IN_US * 100))
+            {
+                refreshDisplayTime = now_in_us;
+                //Refresh the display here
+                //Do not refresh the display unless we got a new discovery message
+                if (discoveryFrameCounterOnLCD != discoveryFrameCounter)
+                {
+                    discoveryFrameCounterOnLCD = discoveryFrameCounter;
+                    update_display(discoveryFrameCounter, 4.2);
+                }
+
+                //Refresh the voltage of the INA219 sensor
+            }
+        }
+#endif
+
         if (isRadioTransmitting)
         {
-            printf("Stage 2\n");
-            if (wav != NULL)
+            if (now_in_us - discoverySend > (ONE_MS_IN_US * 1000))
             {
-                printf("Stage 3\n");
-                if (wav[0] != '\0')
-                {
-                    printf("Stage WAV\n");
-                    send_wav(wav);
-                    sleep(2);
-                }
-                else
-                {
-                    printf("Stage 4\n");
-                    send_test_tone();
-                }
-            }
-            else
-            {
-                printf("Stage Tone\n");
-                send_test_tone();
+                discoverySend = now_in_us;
+                //printf("Sending discovery message...\n");
+                send_discovery_ping();
+                send_radio_tx_queue();
             }
         }
 
         if (isRadioReceiving)
         {
-            struct pcap_pkthdr hdr;
-            const uint8_t *pkt;
-
-            // Drain all available packets
-            while ((pkt = pcap_next(pcap_handle, &hdr)) != NULL)
+            if (usingPcap)
             {
-                parse_radio_message(pkt, hdr.caplen, &hdr);
-                codec2_timeout_check();
-            }
+                struct pcap_pkthdr *hdr_ptr;
+                const u_char *pkt_ptr;
+                int res;
 
+                // In non-blocking mode pcap_next_ex returns:
+                //  1 -> got a packet (hdr_ptr and pkt_ptr set)
+                //  0 -> timeout expired / no packet (non-blocking gives 0 immediately)
+                // -1 -> error
+                // -2 -> EOF (dead capture)
+                while ((res = pcap_next_ex(pcap_handle, &hdr_ptr, &pkt_ptr)) != -1) {
+                    if (res == 0) {
+                        // no packet available right now (non-blocking)
+                        break; // drain loop
+                    }
+                    // res == 1 : have packet
+                    parse_radio_message(pkt_ptr, hdr_ptr->caplen);
+
+                    //After radio message parsed, try to send here?
+                    send_radio_tx_queue();
+                }
+
+                if (res == -1) {
+                    fprintf(stderr, "pcap_next_ex error: %s\n", pcap_geterr(pcap_handle));
+                    cleanup();
+                    //TODO: implement error counter and abort if errors gets a handful.
+                }
+            }
             // else
             // {
-            //     // Drain ring buffer aggressively to prevent overflow
-            //     unsigned int processed = 0;
-            //     unsigned int max_drain = 64; // Process up to 64 frames per iteration
+            //     struct tpacket_hdr *hdr = (struct tpacket_hdr *)((uint8_t *)ring + frame * FRAME_SIZE);
 
-            //     while (processed < max_drain)
-            //     {
-            //         struct tpacket_hdr *hdr = (struct tpacket_hdr *)((uint8_t *)ring + frame * FRAME_SIZE);
+            //     if (!(hdr->tp_status & TP_STATUS_USER))
+            //         break; // No more frames in buffer
 
-            //         if (!(hdr->tp_status & TP_STATUS_USER))
-            //             break; // No more frames in buffer
+            //     uint8_t *pkt = (uint8_t *)hdr + hdr->tp_mac;
+            //     size_t pktlen = hdr->tp_snaplen;
+            //     parse_radio_message(pkt, pktlen);
 
-            //         uint8_t *pkt = (uint8_t *)hdr + hdr->tp_mac;
-            //         size_t pktlen = hdr->tp_snaplen;
-            //         parse_radio_message(pkt, pktlen, (struct pcap_pkthdr *)hdr);
-            //         codec2_timeout_check();
-
-            //         hdr->tp_status = TP_STATUS_KERNEL;
-            //         frame = (frame + 1) % frame_nr;
-            //         processed++;
-            //     }
+            //     hdr->tp_status = TP_STATUS_KERNEL;
+            //     frame = (frame + 1) % frame_nr;
             // }
         }
+
+        audio_channel_timeout_check();
 
         usleep(10); // Allow other processes CPU time
     }
@@ -1424,6 +2122,8 @@ int main(int argc, char *argv[])
     root_check();
     detect_phy(RADIO_IFACE);
 
+    init_tx_queue();
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, sigint);
     signal(SIGTERM, sigint);
@@ -1432,6 +2132,18 @@ int main(int argc, char *argv[])
     {
         perror("setpriority failed (are you root?)");
     }
+
+#ifdef SPI_DISPLAY_ENABLED
+    printf("Enabling SPI display...\n");
+    usingDisplay = init_spi_display();
+    if (!usingDisplay){
+        printf("A SPI fault has been detected...\n");
+    }
+    else
+    {
+        fill_screen_black();
+    }
+#endif
 
     if (argc == 1)
     {
