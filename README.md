@@ -35,7 +35,7 @@ Uses [Codec2](https://github.com/drowe67/codec2) from drowe67, to compress PCM s
 Uses [RadioTap](https://github.com/radiotap/radiotap-library) from the Radiotap org, but extended heavily on the debug logs and parser they had.  
 Heavily inspired by [WFB-ng](https://github.com/svpcom/wfb-ng)  
 Will use zfec by tahoe-lafs [zfec](https://tahoe-lafs.org/trac/zfec/)  
-Will GStreamer libs soon, for the potential audio/packet jitter caused by delayed receives  
+Will use GStreamer libs soon, for the potential audio/packet jitter caused by delayed receives  
 
 ## Further notes
 There may be some audio micro-stuttering, but YMMV. Intend to improve this by using GStreamer libs to eliminate issue, hopefully.
