@@ -46,18 +46,24 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <codec2/codec2.h>
-#include "fec.h"
-#include "ringbuffer.h"
+//#include "fec.h"
+//#include "ringbuffer.h"
 #include <alsa/asoundlib.h>
+#include <linux/i2c-dev.h>
+#include <sys/wait.h>
+#include <pthread.h>
 
+static pthread_mutex_t peer_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #if defined(__x86_64__) || defined(_M_X64)
 #define RADIO_IFACE "wlan0"
+static int rfPower = 3000;
 #else
 #define RADIO_IFACE "wlan1"
 #define SPI_DISPLAY_ENABLED true
 #include <gpiolib.h>
 #define USE_INA219_SENSOR
+static int rfPower = 250;
 #endif
 
 #define AUDIO_CHANNEL_ID 1
@@ -84,11 +90,15 @@
 #define BUFFER_FRAMES (PERIOD_FRAMES * 4)   //Tunable??
 
 #define ONE_MS_IN_US 1000
+#define BUTTON_DEBOUNCE_US     20000ULL   // 20 ms
+#define BUTTON_LONG_PRESS_US  800000ULL   // 800 ms
 
+#ifdef SPI_DISPLAY_ENABLED
 static const char *SPI_DEV = "/dev/spidev0.0";
 static const uint32_t SPI_SPEED = 32000000; // 32 MHz
 static const uint8_t SPI_MODE = SPI_MODE_0;
 static const uint8_t BITS_PER_WORD = 8;
+#endif
 
 // RadioTap message seems to work like this:
 //  Radiotap_hdr -> header data defining the radio's settings, rates, enable/disable certain features, etc.
@@ -131,25 +141,35 @@ static const uint8_t BITS_PER_WORD = 8;
 // From this, it derived that the maximum amount of "data" we can send, is 16 bytes, max.
 // Can be adjusted later in the struct
 
-struct peer_nodes
+struct peer_node
+{
+    uint8_t nodeID[6];      //MAC address of peer
+    uint64_t lastSeen_us;   //Last time it was seen by us.
+    int8_t rssiOne;
+    int8_t rssiTwo;
+    int8_t noiseOne;
+    int8_t noiseTwo;
+};
+
+struct peer_nodes_remote
 {
     uint8_t nodeID[6];      //MAC address of peer
     uint64_t lastSeen_us;   //Last time it was seen by us.
 };
 
-//One more byte available to send
+//Total byte count: 39 bytes!
 struct wpr_mesh
 {
     uint8_t msgtype; // Message type -> 1 byte
     uint8_t dst[6];  // Destination -> 6 bytes
-    uint8_t msg[8];  // 9 bytes of message. (audio or time in 8 bytes)
+    uint8_t msg[32];  // 32 bytes of message data
 };
 
 struct wpr_data
 {
     uint32_t magic_header;
     uint8_t data_type;
-    uint8_t data[16];
+    uint8_t data[40];
     uint8_t fec[6];
 } __attribute__((packed));
 
@@ -195,6 +215,18 @@ struct audio_channel_state
     uint64_t last_rx_us;
 };
 
+typedef enum {
+    BUTTON_EVENT_NONE = 0,
+    BUTTON_EVENT_SHORT,
+    BUTTON_EVENT_LONG
+} button_event_t;
+
+typedef struct {
+    int fd;
+    uint8_t addr;
+    float current_lsb_a;   // amps per bit
+} ina219_t;
+
 /* ---------------- some variables ---------------- */
 
 
@@ -230,6 +262,15 @@ struct radiotap_hdr rtap_tx;
 
 static struct audio_channel_state channels[4];
 static struct wpr_queue tx_queue;
+#ifdef USE_INA219_SENSOR
+static uint16_t ina219_bus_mv = 0;
+static float ina219_current_ma = 0;
+#endif
+ina219_t ina;
+int8_t ant1RSSI_dBm = -120;
+int8_t ant2RSSI_dBm = -120;
+int8_t ant1Noise_dBm = -120;
+int8_t ant2Noise_dBm = -120;
 
 #define PCM_BYTE_COUNT 160                             /* 20 ms of mono audio at 8 kHz */
 #define PCM_100MS_BYTE_COUNT (PCM_BYTE_COUNT * 5)      // enough for 100 ms of audio, 160 bytes per 20 ms frame * 5 = 800 bytes
@@ -240,28 +281,135 @@ int16_t pcmToneBuffer[TEST_TONE_INTERVAL]; // about 1 second of tone at 8 kHz, 1
 //RingBuffer audioBuf;
 snd_pcm_t *pcmDevice;
 bool soundCardFound = false;
-uint16_t discoveryFrameCounter = 0;
-uint16_t discoveryFrameCounterOnLCD = 0;
+uint64_t discoveryFrameRX = 0;
+uint64_t discoveryFrameTX = 0;
 
 #define SPI_DISPLAY_RST 22
 #define SPI_DISPLAY_CMD 24
 #define SPI_DISPLAY_BKL 12
 #define TFT_HEIGHT 160
 #define TFT_WIDTH 128
+uint16_t framebuffer[TFT_WIDTH * TFT_HEIGHT];
 
-#define APP_VERSION "WPR dev-0.1.1"
-#define HEART_BLINK_INTERVAL_S 1 // heartbeat every second
+#define APP_VERSION "WPR dev-0.1.3"
 #define FONT_SPACING 1           // extra spacing between chars
 #define TOP_MARGIN 2
 #define RIGHT_MARGIN 2
 #define CENTER_MARGIN 0
 
-// Sensor section
-#define INA219_SENSOR_ADDR 0x40
-#define INA219_SENSOR_X 0
+// Sensor + button section
+#define BUTTON_GPIO 21
+#define INA219_SENSOR_ADDR   0x40
+#define INA219_REG_CONFIG    0x00
+#define INA219_REG_SHUNT     0x01
+#define INA219_REG_BUS       0x02
+#define INA219_REG_POWER     0x03
+#define INA219_REG_CURRENT   0x04
+#define INA219_REG_CALIB     0x05
 
+#define INA219_CFG_BVOLT_32V        (1u << 13)
+#define INA219_CFG_GAIN_320MV       (3u << 11)
+#define INA219_CFG_BADC_12BIT       (3u << 7)
+#define INA219_CFG_SADC_12BIT       (3u << 3)
+#define INA219_CFG_MODE_CONT        7u
+
+#define MAX_PEERS            32
+#define PEER_TIMEOUT_US      200000ULL   // 200 ms
+
+static struct peer_node local_peer_nodes[MAX_PEERS];
+static bool local_peer_used[MAX_PEERS];
 
 unsigned gpio_rst, gpio_cmd, gpio_bl = 0;
+
+char *mac_to_string(const uint8_t mac[6])
+{
+    static char mac_str[18];
+    sprintf(mac_str, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return mac_str;
+}
+
+static int peer_find_index(const uint8_t mac[6])
+{
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (local_peer_used[i] &&
+            memcmp(local_peer_nodes[i].nodeID, mac, 6) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int peer_find_free_index(void)
+{
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (!local_peer_used[i]) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void peer_update_from_pong(const uint8_t mac[6], int8_t ant1db, int8_t ant1nse, int8_t ant2db, int8_t ant2nse, uint64_t now)
+{
+    pthread_mutex_lock(&peer_mutex);
+    int idx = peer_find_index(mac);
+
+    if (idx < 0) {
+        idx = peer_find_free_index();
+        if (idx < 0) {
+            // Table full, drop the oldest entry or just ignore
+            printf("Local-peer table full!\n");
+            return;
+        }
+
+        //printf("Creating new peer entry...\n");
+        local_peer_used[idx] = true;
+        memcpy(local_peer_nodes[idx].nodeID, mac, 6);
+    }
+
+    //printf("Updating peerID: %s, current_ts: %lu\n", mac_to_string(local_peer_nodes[idx].nodeID), now);
+    local_peer_nodes[idx].lastSeen_us = now;
+    local_peer_nodes[idx].rssiOne = ant1db;
+    local_peer_nodes[idx].noiseOne = ant1nse;
+    local_peer_nodes[idx].rssiTwo = ant2db;
+    local_peer_nodes[idx].noiseTwo = ant2nse;
+
+    pthread_mutex_unlock(&peer_mutex);
+}
+
+static int peer_count(void)
+{
+    pthread_mutex_lock(&peer_mutex);
+    int count = 0;
+
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (local_peer_used[i]) {
+            count++;
+        }
+    }
+    pthread_mutex_unlock(&peer_mutex);
+
+    return count;
+}
+
+static void peer_cleanup_old(uint64_t now, uint64_t cleanupTime)
+{
+    pthread_mutex_lock(&peer_mutex);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (!local_peer_used[i]) {
+            continue;
+        }
+
+        uint64_t age = now - local_peer_nodes[i].lastSeen_us;
+
+        if ((age) >= cleanupTime) {
+            local_peer_used[i] = false;
+            printf("Cleaning up node: %s, age: %lu\n", mac_to_string(local_peer_nodes[i].nodeID), age);
+            memset(&local_peer_nodes[i], 0, sizeof(local_peer_nodes[i]));
+        }
+    }
+    pthread_mutex_unlock(&peer_mutex);
+}
 
 static void init_tx_queue(void)
 {
@@ -409,24 +557,40 @@ static int set_fd_nonblocking(int fd)
     return 0;
 }
 
-char *mac_to_string(const uint8_t mac[6])
-{
-    static char mac_str[18];
-    sprintf(mac_str, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    return mac_str;
-}
-
 static void run_cmd(const char *cmd)
 {
     int ret = system(cmd);
-    if (ret != 0)
-    {
-        fprintf(stderr, "Command failed: %s\n", cmd);
-        cleanup();
+
+    if (ret == -1) {
+        perror("system");
+        return;
+    }
+
+    if (WIFEXITED(ret)) {
+        int code = WEXITSTATUS(ret);
+        if (code != 0) {
+            fprintf(stderr, "Command failed (%d): %s\n", code, cmd);
+            return;
+        }
+    } else {
+        fprintf(stderr, "Command did not exit normally: %s\n", cmd);
+        return;
     }
 }
 
+static void setRFPower(int power)
+{
+    printf("Setting rfpower to: %d\n", power);
+
+    char cmd[100];
+    snprintf(cmd, sizeof(cmd), "iw dev %s set txpower fixed %d", RADIO_IFACE, power);
+    run_cmd(cmd);
+}
+
 #ifdef SPI_DISPLAY_ENABLED
+
+#define X_OFFSET 2
+#define Y_OFFSET 1
 
 static bool init_gpio(void)
 {
@@ -449,16 +613,31 @@ static bool init_gpio(void)
     gpio_set_fsel(SPI_DISPLAY_BKL, GPIO_FSEL_GPIO);
     gpio_set_fsel(SPI_DISPLAY_CMD, GPIO_FSEL_GPIO);
     gpio_set_fsel(SPI_DISPLAY_RST, GPIO_FSEL_GPIO);
+    gpio_set_fsel(BUTTON_GPIO, GPIO_FSEL_GPIO);
 
     gpio_set_dir(SPI_DISPLAY_BKL, DIR_OUTPUT);
     gpio_set_dir(SPI_DISPLAY_CMD, DIR_OUTPUT);
     gpio_set_dir(SPI_DISPLAY_RST, DIR_OUTPUT);
+    gpio_set_dir(BUTTON_GPIO, DIR_INPUT);
 
     gpio_clear(SPI_DISPLAY_BKL);
     gpio_clear(SPI_DISPLAY_CMD);
     gpio_clear(SPI_DISPLAY_RST);
 
+    gpio_set_pull(BUTTON_GPIO, PULL_UP);
+
     return true;
+}
+
+static bool readButton(void)
+{
+    int res = gpio_get_level(BUTTON_GPIO);
+
+    if (res < 0) {
+        return false;
+    }
+
+    return (res == 0);
 }
 
 int spi_write_bytes(const uint8_t *buf, size_t len) {
@@ -523,100 +702,6 @@ static bool init_spi_display(){
     //Switch on the backlight GPIO pin
     gpio_set(SPI_DISPLAY_BKL);
     return true;
-}
-
-void fill_screen_black(void) {
-
-    // Column address: CASET (0x2A) -> start col high, start col low, end col high, end col low
-    send_command(0x2A);
-    uint8_t coldata[4] = { 0x00, 0x00, 0x00, 0x7F }; // 0..127
-    send_data(coldata, 4);
-
-    // Row address: RASET (0x2B)
-    send_command(0x2B);
-    uint8_t rowdata[4] = { 0x00, 0x00, 0x00, 0x9F }; // 0..159
-    send_data(rowdata, 4);
-
-    // Memory write
-    send_command(0x2C);
-
-    // Stream pixel data in chunks to avoid huge allocations.
-    // Each pixel is 2 bytes for RGB565. For black: 0x00, 0x00.
-    const size_t PIXELS = TFT_WIDTH * TFT_HEIGHT;
-    const size_t BYTES_TOTAL = PIXELS * 2;
-    const size_t CHUNK_BYTES = 4096; // choose a chunk size (must be even)
-    uint8_t chunk[CHUNK_BYTES];
-    // fill chunk with zeros (black)
-    memset(chunk, 0x00, CHUNK_BYTES);
-
-    size_t remaining = BYTES_TOTAL;
-    while (remaining) {
-        size_t to_send = remaining > CHUNK_BYTES ? CHUNK_BYTES : remaining;
-        // ensure to_send is even (2 bytes per pixel)
-        if (to_send & 1) to_send--;
-        if (to_send == 0) break;
-        send_data(chunk, to_send);
-        remaining -= to_send;
-    }
-}
-
-// Helper: convert 8-bit RGB to RGB565
-static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) 
-{
-    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
-}
-
-// ST7735 helper: set address window (column/row)
-static void set_address_window(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1) 
-{
-    uint8_t data[4];
-    // CASET
-    send_command(0x2A);
-    data[0] = 0x00; data[1] = x0; data[2] = 0x00; data[3] = x1;
-    send_data(data, 4);
-    // RASET
-    send_command(0x2B);
-    data[0] = 0x00; data[1] = y0; data[2] = 0x00; data[3] = y1;
-    send_data(data, 4);
-    // MEMWR will be issued by caller
-}
-// push repeated color pixels (count pixels, color is RGB565)
-static void push_color_repeat(uint16_t color, size_t count) {
-    // send_data expects bytes; create a small chunk buffer of pairs
-    const size_t CHUNK_PIXELS = 512; // 512 pixels => 1024 bytes (adjust if memory constrained)
-    uint8_t chunk[CHUNK_PIXELS * 2];
-    // fill chunk with color in big-endian (MSB first for ST7735)
-    chunk[0] = (uint8_t)(color >> 8);
-    chunk[1] = (uint8_t)(color & 0xFF);
-    for (size_t i = 1; i < CHUNK_PIXELS; ++i) {
-        chunk[i*2 + 0] = chunk[0];
-        chunk[i*2 + 1] = chunk[1];
-    }
-
-    send_command(0x2C); // memory write
-    size_t remaining = count;
-    while (remaining) {
-        size_t to_pixels = remaining > CHUNK_PIXELS ? CHUNK_PIXELS : remaining;
-        send_data(chunk, to_pixels * 2);
-        remaining -= to_pixels;
-    }
-}
-
-// draw filled rectangle with color
-static void fill_rect(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint16_t color) {
-    if ((x >= TFT_WIDTH) || (y >= TFT_HEIGHT)) return;
-    if (x + w - 1 >= TFT_WIDTH) w = TFT_WIDTH - x;
-    if (y + h - 1 >= TFT_HEIGHT) h = TFT_HEIGHT - y;
-    set_address_window(x, y, x + w - 1, y + h - 1);
-    push_color_repeat(color, (size_t)w * h);
-}
-
-// draw single pixel
-static void draw_pixel(uint8_t x, uint8_t y, uint16_t color) {
-    set_address_window(x, y, x, y);
-    uint8_t b[2] = { (uint8_t)(color >> 8), (uint8_t)(color & 0xFF) };
-    send_command(0x2C);
-    send_data(b, 2);
 }
 
 /* 5x7 font (96 chars: ASCII 32..127)
@@ -722,63 +807,121 @@ static const uint8_t font5x7[96][5] = {
     {0x10,0x08,0x08,0x10,0x08}, // ~
 };
 
-// draw a character (foreground color on background color)
-static void draw_char(uint8_t x, uint8_t y, char c, uint16_t fg, uint16_t bg) {
+// Helper: convert 8-bit RGB to RGB565 
+static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)); 
+}
+
+// ST7735 helper: set address window (column/row)
+static void set_address_window(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1) 
+{
+    uint8_t data[4];
+    send_command(0x2A);
+    data[0] = 0x00;
+    data[1] = x0 + X_OFFSET;
+    data[2] = 0x00;
+    data[3] = x1 + X_OFFSET;
+    send_data(data, 4);
+
+    send_command(0x2B);
+    data[0] = 0x00;
+    data[1] = y0 + Y_OFFSET;
+    data[2] = 0x00;
+    data[3] = y1 + Y_OFFSET;
+    send_data(data, 4);
+}
+
+void fill_screen_black(void)
+{
+    memset(framebuffer, 0x00, sizeof(framebuffer));
+}
+
+void flush_framebuffer(void)
+{
+    set_address_window(0, 0, TFT_WIDTH - 1, TFT_HEIGHT - 1);
+    send_command(0x2C);
+
+    /*
+     * Send in chunks, byte-swapped for ST7735 RGB565.
+     * This is much better than sending one pixel at a time.
+     */
+    enum { PIXELS_PER_CHUNK = 256 };
+    uint8_t out[PIXELS_PER_CHUNK * 2];
+
+    size_t total_pixels = (size_t)TFT_WIDTH * TFT_HEIGHT;
+
+    for (size_t i = 0; i < total_pixels; ) {
+        size_t n = total_pixels - i;
+        if (n > PIXELS_PER_CHUNK) n = PIXELS_PER_CHUNK;
+
+        for (size_t j = 0; j < n; j++) {
+            uint16_t px = framebuffer[i + j];
+            out[j * 2 + 0] = (uint8_t)(px >> 8);
+            out[j * 2 + 1] = (uint8_t)(px & 0xFF);
+        }
+
+        send_data(out, n * 2);
+        i += n;
+    }
+}
+
+static inline void fb_set_pixel(uint8_t x, uint8_t y, uint16_t color)
+{
+    if (x >= TFT_WIDTH || y >= TFT_HEIGHT) return;
+    framebuffer[(size_t)y * TFT_WIDTH + x] = color;
+}
+
+static void fb_fill_rect(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint16_t color)
+{
+    if (x >= TFT_WIDTH || y >= TFT_HEIGHT) return;
+
+    if ((uint16_t)x + w > TFT_WIDTH)  w = TFT_WIDTH - x;
+    if ((uint16_t)y + h > TFT_HEIGHT) h = TFT_HEIGHT - y;
+
+    for (uint8_t yy = 0; yy < h; yy++) {
+        size_t row = (size_t)(y + yy) * TFT_WIDTH + x;
+        for (uint8_t xx = 0; xx < w; xx++) {
+            framebuffer[row + xx] = color;
+        }
+    }
+}
+
+static void fb_draw_char(uint8_t x, uint8_t y, char c, uint16_t fg, uint16_t bg)
+{
     if (c < 32 || c > 127) c = '?';
     const uint8_t *ch = font5x7[c - 32];
-    // each char is 5x7, we'll add 1 column spacing
-    // draw background rectangle for char (6x8)
-    fill_rect(x, y, 6, 8, bg);
 
-    for (uint8_t col = 0; col < 5; ++col) {
+    fb_fill_rect(x, y, 6, 8, bg);
+
+    for (uint8_t col = 0; col < 5; col++) {
         uint8_t colbits = ch[col];
-        for (uint8_t row = 0; row < 7; ++row) {
-            if (colbits & (1 << row)) {
-                draw_pixel(x + col, y + row, fg);
+        for (uint8_t row = 0; row < 7; row++) {
+            if (colbits & (1U << row)) {
+                fb_set_pixel(x + col, y + row, fg);
             }
         }
     }
 }
 
-// draw a text string (left-to-right)
-static void draw_text(uint8_t x, uint8_t y, const char *s, uint16_t fg, uint16_t bg) {
+static void fb_draw_text(uint8_t x, uint8_t y, const char *s, uint16_t fg, uint16_t bg)
+{
     while (*s) {
-        draw_char(x, y, *s, fg, bg);
+        fb_draw_char(x, y, *s, fg, bg);
         x += 6 + FONT_SPACING;
-        ++s;
+        s++;
     }
 }
 
-// small heart bitmap (12x12) precomputed in RGB565 (MSB,LSB pairs).
-// This is a 12x12 red heart shape; transparent pixels encoded as 0x0000 (black).
-static const uint16_t heart12[12*12] = {
-    // row-major 12x12; 0xF800 for red, 0x0000 for transparent
-    // handcrafted pattern
-    0x0000,0x0000,0x0000,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,0x0000,0x0000,0x0000,
-    0x0000,0x0000,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,0x0000,0x0000,
-    0x0000,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,0x0000,
-    0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,
-    0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,
-    0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,
-    0x0000,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,0x0000,
-    0x0000,0x0000,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,0x0000,0x0000,
-    0x0000,0x0000,0x0000,0xF800,0xF800,0xF800,0xF800,0xF800,0x0000,0x0000,0x0000,0x0000,
-    0x0000,0x0000,0x0000,0x0000,0xF800,0xF800,0xF800,0x0000,0x0000,0x0000,0x0000,0x0000,
-    0x0000,0x0000,0x0000,0x0000,0x0000,0xF800,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,
-    0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000
-};
-
-// draw a small bitmap (16-bit per pixel array)
 static void draw_bitmap_rgb565(uint8_t x, uint8_t y, const uint16_t *bmp, uint8_t w, uint8_t h, uint16_t bg)
 {
-    // fill background rect first
-    fill_rect(x, y, w, h, bg);
-    // then draw pixels
-    for (uint8_t row = 0; row < h; ++row) {
-        for (uint8_t col = 0; col < w; ++col) {
+    fb_fill_rect(x, y, w, h, bg);
+
+    for (uint8_t row = 0; row < h; row++) {
+        for (uint8_t col = 0; col < w; col++) {
             uint16_t p = bmp[row * w + col];
-            if (p != 0x0000) { // treat 0x0000 as transparent/skip (if you want black use other pattern)
-                draw_pixel(x + col, y + row, p);
+            if (p != 0x0000) {
+                fb_set_pixel(x + col, y + row, p);
             }
         }
     }
@@ -792,15 +935,23 @@ static void format_voltage_str(char *buf, size_t buf_len, float volts)
     snprintf(buf, buf_len, "%.2fV", volts);
 }
 
+static void format_current_str(char *buf, size_t buf_len, float curr)
+{
+    // ensure one decimal or two decimals as desired
+    // we'll print with 2 decimals
+    snprintf(buf, buf_len, "%.2fmA", curr);
+}
+
 // Clear entire screen to bg color
 static void clear_screen(uint16_t bg_color)
 {
-    fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, bg_color);
+    fb_fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, bg_color);
 }
 
 // Compose and update the fields: battery, version, center counter, heart state
-static void update_display(uint16_t discovery_count, float batt_voltage)
+static void update_display()
 {
+    int peers_count = peer_count();
     // colors
     uint16_t black = rgb565(0,0,0);
     uint16_t white = rgb565(255,255,255);
@@ -811,45 +962,248 @@ static void update_display(uint16_t discovery_count, float batt_voltage)
 
     // top-right: battery voltage and version (stacked)
     char volt_buf[16];
+    float batt_voltage = (ina219_bus_mv / 1000.00);
     format_voltage_str(volt_buf, sizeof(volt_buf), batt_voltage);
 
-    // Decide where to place strings so they are right-justified
-    // text width = (6 + FONT_SPACING)*chars - FONT_SPACING -> simpler compute per char 6
-    size_t volt_len = strlen(volt_buf);
-    //size_t ver_len  = strlen(APP_VERSION);
-    int volt_w = (int)volt_len * (6 + FONT_SPACING);
-    //int ver_w  = (int)ver_len  * (6 + FONT_SPACING);
+    char current_buf[16];
+    format_current_str(current_buf, sizeof(current_buf), ina219_current_ma);
 
-    int x_volt = TFT_WIDTH - volt_w - RIGHT_MARGIN;
-    //int x_ver  = TFT_WIDTH - ver_w - RIGHT_MARGIN;
-    int y_volt = TOP_MARGIN;
-    //int y_ver  = TOP_MARGIN + 8 + 2; // below voltage (8 px high font + small gap)
+    //-------------------------------------
+    //Show WPR version on top
+    char wpr_version[64];
+    snprintf(wpr_version, sizeof(wpr_version), "%s", APP_VERSION);
+    int app_info_width = (int)strlen(wpr_version);
+    int x_app = (TFT_WIDTH - app_info_width * (6 + FONT_SPACING)) / 2;
+    int y_app = TOP_MARGIN + 5;
+    fb_draw_text((uint8_t)x_app, (uint8_t)y_app, wpr_version, white, black);
 
-    draw_text((uint8_t)x_volt, (uint8_t)y_volt, volt_buf, white, black);
-    //draw_text((uint8_t)x_ver,  (uint8_t)y_ver,  APP_VERSION, white, black);
+    char batt_volt[32];
+    snprintf(batt_volt, sizeof(batt_volt), "BATT: %s", volt_buf);
+    int batt_info_width = (int)strlen(batt_volt);
+    int x_batt = (TFT_WIDTH - batt_info_width * (6 + FONT_SPACING)) / 2;
+    int y_batt = y_app + 12;
+    fb_draw_text((uint8_t)x_batt, (uint8_t)y_batt, batt_volt, white, black);
 
-    // center: "Discovery: N"
-    char center_buf[32];
-    snprintf(center_buf, sizeof(center_buf), "Discovery:%u", discovery_count);
-    int center_len = strlen(center_buf);
-    int cx = (TFT_WIDTH - center_len * (6 + FONT_SPACING)) / 2;
-    int cy = (TFT_HEIGHT - 8) / 2 - 8; // a little above center
+    
+    char batt_curr[32];
+    snprintf(batt_curr, sizeof(batt_curr), "CURR: %s", current_buf);
+    int batt_curr_width = (int)strlen(batt_curr);
+    int x_curr = (TFT_WIDTH - batt_curr_width * (6 + FONT_SPACING)) / 2;
+    int y_curr = y_batt + 12;
+    fb_draw_text((uint8_t)x_curr, (uint8_t)y_curr, batt_curr, white, black);
+
+
+    char rx_info[64];
+    snprintf(rx_info, sizeof(rx_info), "DSC RX: %lu", discoveryFrameRX);
+    int rx_info_len = strlen(rx_info);
+    int cx = (TFT_WIDTH - rx_info_len * (6 + FONT_SPACING)) / 2;
+    int cy = y_curr + 12;
     if (cx < 0) cx = 0;
-    draw_text((uint8_t)cx, (uint8_t)cy, center_buf, white, black);
+    fb_draw_text((uint8_t)cx, (uint8_t)cy, rx_info, white, black);
+    
+    char tx_info[64];
+    snprintf(tx_info, sizeof(tx_info), "DSC TX: %lu", discoveryFrameTX);
+    int tx_info_len = strlen(tx_info);
+    cx = (TFT_WIDTH - tx_info_len * (6 + FONT_SPACING)) / 2;
+    int tx_y = cy + 12;
+    if (cx < 0) cx = 0;
+    fb_draw_text((uint8_t)cx, (uint8_t)tx_y, tx_info, white, black);
+
+    char rf_buf[32];
+    if (rfPower == 3000){
+        snprintf(rf_buf, sizeof(rf_buf), "RFP: POWWAAA!");
+    }else{
+        snprintf(rf_buf, sizeof(rf_buf), "RFP: %d", rfPower);
+    }
+
+    int rf_len = strlen(rf_buf);
+    int rfx = (TFT_WIDTH - rf_len * (6 + FONT_SPACING)) / 2;
+    int rfy = tx_y + 12;
+
+    if (rfx < 0) rfx = 0;
+
+    if (rfPower == 3000)
+    {
+        fb_draw_text((uint8_t)rfx, (uint8_t)rfy, rf_buf, red, black);
+    }
+    else
+    {
+        fb_draw_text((uint8_t)rfx, (uint8_t)rfy, rf_buf, white, black);
+    }
+
+    char peer_count_buf[32];
+    snprintf(peer_count_buf, sizeof(peer_count_buf), "Peers: %d", peers_count);
+    int peer_len = strlen(peer_count_buf);
+    int peerx = (TFT_WIDTH - peer_len * (6 + FONT_SPACING)) / 2;
+    int peery = rfy + 12;
+    if (peerx < 0) peerx = 0;
+    fb_draw_text((uint8_t)peerx, (uint8_t)peery, peer_count_buf, white, black);
+
+    char rssi_buf[64];
+    snprintf(rssi_buf, sizeof(rssi_buf), "RSSI: %d, %d", ant1RSSI_dBm, ant2RSSI_dBm);
+    int rssi_len = strlen(rssi_buf);
+    int rssix = (TFT_WIDTH - rssi_len * (6 + FONT_SPACING)) / 2;
+    int rssiy = peery + 12;
+    if (rssix < 0) rssix = 0;
+    fb_draw_text((uint8_t)rssix, (uint8_t)rssiy, rssi_buf, white, black);
+
+    char noise_buf[64];
+    snprintf(noise_buf, sizeof(noise_buf), "Noise: %d, %d", ant1Noise_dBm, ant2Noise_dBm);
+    int noise_len = strlen(noise_buf);
+    int noisex = (TFT_WIDTH - noise_len * (6 + FONT_SPACING)) / 2;
+    int noisey = rssiy + 12;
+    if (noisex < 0) noisex = 0;
+    fb_draw_text((uint8_t)noisex, (uint8_t)noisey, noise_buf, white, black);
+
+    flush_framebuffer();
 }
 
 #endif
 
 #ifdef USE_INA219_SENSOR
-static bool setup_i2c_bus(void)
+
+static int ina219_write_u16(int fd, uint8_t reg, uint16_t value)
 {
-    //Setup the i2c bus and return true if OK.
-    return true;
+    uint8_t buf[3];
+    buf[0] = reg;
+    buf[1] = (uint8_t)(value >> 8);   // MSB first
+    buf[2] = (uint8_t)(value & 0xFF);
+
+    return (write(fd, buf, 3) == 3) ? 0 : -1;
 }
 
-// TODO: Implement INA219 sensor stuff here.
+static int ina219_read_u16(int fd, uint8_t reg, uint16_t *value)
+{
+    uint8_t r = reg;
+    uint8_t buf[2];
+
+    if (write(fd, &r, 1) != 1) {
+        return -1;
+    }
+
+    if (read(fd, buf, 2) != 2) {
+        return -1;
+    }
+
+    *value = ((uint16_t)buf[0] << 8) | buf[1];
+    return 0;
+}
+
+static int ina219_init(ina219_t *dev, int fd, uint8_t addr, float shunt_ohms, float max_expected_current_a)
+{
+    if (ioctl(fd, I2C_SLAVE, addr) < 0) {
+        printf("INA219 fault detected \n");
+        dev->fd = -1;
+        close(i2c_fd);
+        return -1;
+    }
+
+    dev->fd = fd;
+    dev->addr = addr;
+
+    /*
+     * Pick current_LSB based on the max expected current.
+     * Example: 3.2A max -> about 97.7uA per bit.
+     */
+    dev->current_lsb_a = max_expected_current_a / 32768.0f;
+
+    /*
+     * Calibration formula from INA219 datasheet:
+     * Cal = 0.04096 / (Current_LSB * Rshunt)
+     */
+    uint16_t cal = (uint16_t)(0.04096f / (dev->current_lsb_a * shunt_ohms));
+    if (cal == 0) {
+        return -1;
+    }
+
+    if (ina219_write_u16(fd, INA219_REG_CALIB, cal) < 0) {
+        return -1;
+    }
+
+    /*
+     * Continuous shunt and bus voltage conversion.
+     * 32V range, 320mV shunt gain, 12-bit conversions.
+     */
+    uint16_t config =
+        INA219_CFG_BVOLT_32V |
+        INA219_CFG_GAIN_320MV |
+        INA219_CFG_BADC_12BIT |
+        INA219_CFG_SADC_12BIT |
+        INA219_CFG_MODE_CONT;
+
+    if (ina219_write_u16(fd, INA219_REG_CONFIG, config) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int ina219_read_bus_voltage_mv(ina219_t *dev, uint16_t *mv)
+{
+    uint16_t raw;
+
+    if (ina219_read_u16(dev->fd, INA219_REG_BUS, &raw) < 0) {
+        return -1;
+    }
+
+    /*
+     * Bus voltage register:
+     * bits [15:3] contain value, LSB = 4mV
+     */
+    raw >>= 3;
+    *mv = (uint16_t)(raw * 4);
+
+    return 0;
+}
+
+static int ina219_read_current_ma(ina219_t *dev, float *current_ma)
+{
+    uint16_t raw_u16;
+    int16_t raw_s16;
+
+    if (ina219_read_u16(dev->fd, INA219_REG_CURRENT, &raw_u16) < 0) {
+        return -1;
+    }
+
+    raw_s16 = (int16_t)raw_u16;
+
+    /*
+     * Current register = signed value * current_lsb
+     */
+    *current_ma = (float)raw_s16 * dev->current_lsb_a * 1000.0f;
+
+    return 0;
+}
+
+static void setup_ina219(void)
+{
+    printf("Setting up i2c-bus...\n");
+
+    i2c_fd = open("/dev/i2c-1", O_RDWR);
+    if (i2c_fd < 0) {
+        perror("Failed to open I2C bus");
+    }
+
+    if (ina219_init(&ina, i2c_fd, 0x40, 0.1f, 3.2f) < 0) {
+        printf("Unable to init INA219 sensor...");
+    }
+}
+
+static void read_ina219(void)
+{
+    if (ina.fd <= 0){
+        return;
+    }
+
+    if (!(ina219_read_bus_voltage_mv(&ina, &ina219_bus_mv) == 0 && ina219_read_current_ma(&ina, &ina219_current_ma) == 0))
+    {
+        ina219_bus_mv = 0;
+        ina219_current_ma = 0;
+    }
+}
 
 #endif
+
 static void setup_radio_monitor(void)
 {
     if (debug)
@@ -868,11 +1222,11 @@ static void setup_radio_monitor(void)
     run_cmd("iwconfig " RADIO_IFACE " channel 36");
 #endif
 
-    // Leave txpower for now
-    run_cmd("iw dev " RADIO_IFACE " set txpower fixed 300"); // powaaa
+    //Default rfPower on app start
+    setRFPower(rfPower);
+
     // Do HT or VHT (high throughput or Very High Throughput), leave disabled for now
     // Radio is default on 20Mhz bw, which is fine.
-
     run_cmd("ip link set " RADIO_IFACE " up");
 }
 
@@ -1416,6 +1770,9 @@ static void decode_codec2_voice_data(const uint8_t *voice, size_t voice_len)
 }
 
 static void send_discovery_ping(){
+    //TODO: Make sure it does not roll over and let app crash.
+    discoveryFrameTX++;
+
     struct wpr_mesh mesh_tx;
     memset(mesh_tx.dst, 0xFF, 6);
     mesh_tx.msgtype = RADIO_DATA_MESH_MSG_DISCOVERY_PING;
@@ -1456,10 +1813,14 @@ static void send_discovery_pong(uint8_t addr[6]){
     }
 }
 
-static void process_wpr_data_rx(uint8_t srcAddr[6], uint8_t ant1, uint8_t ant2)
+static void process_wpr_data_rx(uint8_t srcAddr[6], int8_t ant1rssi, int8_t ant2rssi, int8_t ant1nois, int8_t ant2nois)
 {
     uint8_t data_type = wpr_data_rx.data_type;
-
+    ant1RSSI_dBm = ant1rssi;
+    ant2RSSI_dBm = ant2rssi;
+    ant1Noise_dBm = ant1nois;
+    ant2Noise_dBm = ant2nois;
+    
     // TODO: Implement FEC stuff
 
     switch (data_type)
@@ -1539,21 +1900,17 @@ process_wpr_mesh:
     {
         //We got a discovery ping message, send a pong message.
     case RADIO_DATA_MESH_MSG_DISCOVERY_PING:
-        if (discoveryFrameCounter == 65534)
-        {
-            discoveryFrameCounter = 0;
-        }
-        else
-        {
-            discoveryFrameCounter++;
-        }
+        //TODO, make sure it does not roll over and crash and burn.
+        discoveryFrameRX++;
 
-        printf("Ping message from: %s, Ant-1: %d dBm, Ant-2: %d dBm\n", mac_to_string(srcAddr), ant1, ant2);
+        //printf("Ping message from: %s, Ant1-> RSSI: %d dBm, Noise: %d, Ant2 -> RSSI: %d dBm, Noise: %d\n", mac_to_string(srcAddr), ant1rssi, ant1nois, ant2rssi, ant2nois);
         send_discovery_pong(srcAddr);
         break;
     case RADIO_DATA_MESH_MSG_DISCOVERY_PONG:
-        //We got a response from the other side, use the time.
-        printf("Pong message from: %s, Ant-1: %d dBm, Ant-2: %d dBm\n", mac_to_string(srcAddr), ant1, ant2);
+
+        peer_update_from_pong(srcAddr, ant1rssi, ant1nois, ant2rssi, ant2nois, now_us());
+        //printf("Pong message from: %s, Ant1-> RSSI: %d dBm, Noise: %d, Ant2 -> RSSI: %d dBm, Noise: %d\n", mac_to_string(srcAddr), ant1rssi, ant1nois, ant2rssi, ant2nois);
+
         break;
     case RADIO_DATA_MESH_MSG_FORWARD_AUDIO:
         printf("Feature not available yet.\n");
@@ -1565,11 +1922,12 @@ process_wpr_mesh:
 }
 
 static void parse_radio_message(const uint8_t *pkt, size_t len)
-//static void parse_radio_message(const uint8_t *pkt, size_t len, const struct pcap_pkthdr *pcaphdr)
 {
     uint8_t antIndex = 0;
-    uint8_t ant1dBm = 0;
-    uint8_t ant2dBm = 0;
+    int8_t ant1dBm = 0;
+    int8_t ant2dBm = 0;
+    int8_t ant1noise = 0;
+    int8_t ant2noise = 0;
 
     // TODO: Implement FCS data framing
     // Start to decode the ieee80211_radiotap_header data
@@ -1711,13 +2069,21 @@ static void parse_radio_message(const uint8_t *pkt, size_t len)
                     }
                 }
                 break;
+            case IEEE80211_RADIOTAP_DBM_ANTNOISE:
+                {
+                    if (antIndex == 0){
+                        ant1noise = *(int8_t *)it.this_arg;
+                    }else{
+                        ant2noise = *(int8_t *)it.this_arg;
+                    }
+                }
+                break;
             case IEEE80211_RADIOTAP_ANTENNA:
                 {
                     antIndex++;
                 }
                 break;
             //case IEEE80211_RADIOTAP_RX_FLAGS:
-            //case IEEE80211_RADIOTAP_DBM_ANTNOISE:
             default:
                 break;
             }
@@ -1827,7 +2193,7 @@ static void parse_radio_message(const uint8_t *pkt, size_t len)
     // }
 
     memcpy(&wpr_data_rx, body_start, sizeof(struct wpr_data));
-    process_wpr_data_rx(mac_hdr->addr3, ant1dBm, ant2dBm);
+    process_wpr_data_rx(mac_hdr->addr3, ant1dBm, ant2dBm, ant1noise, ant2noise);
 }
 
 static void gen_tone(int16_t *pcm, int n)
@@ -1937,6 +2303,69 @@ static void printParameters(void)
     printf("Parameters: <programName> <rx/tx> <audiofilename-to-tx>\n");
 }
 
+#ifdef SPI_DISPLAY_ENABLED
+static button_event_t button_update(void)
+{
+    static bool last_raw = false;
+    static bool stable_state = false;
+    static uint64_t last_change_us = 0;
+    static uint64_t press_start_us = 0;
+
+    uint64_t now = now_us();
+    bool raw = readButton();
+
+    if (raw != last_raw) {
+        last_raw = raw;
+        last_change_us = now;
+    }
+
+    if ((now - last_change_us) < BUTTON_DEBOUNCE_US) {
+        return BUTTON_EVENT_NONE;
+    }
+
+    if (stable_state != raw) {
+        stable_state = raw;
+
+        if (stable_state) {
+            press_start_us = now;
+        } else {
+            uint64_t held_us = now - press_start_us;
+
+            if (held_us >= BUTTON_LONG_PRESS_US) {
+                return BUTTON_EVENT_LONG;
+            } else {
+                return BUTTON_EVENT_SHORT;
+            }
+        }
+    }
+
+    return BUTTON_EVENT_NONE;
+}
+
+static void doButtonStuff(void)
+{
+    button_event_t ev = button_update();
+
+    switch (ev) {
+        case BUTTON_EVENT_SHORT:
+            rfPower += 250;
+            if (rfPower > 3000) {
+                rfPower = 250;
+            }
+            setRFPower(rfPower);
+            break;
+
+        case BUTTON_EVENT_LONG:
+            printf("Shutting down...\n");
+            run_cmd("poweroff");
+            break;
+
+        default:
+            break;
+    }
+}
+#endif
+
 static void do_main_loop(int argc, char *argv[])
 {
     if (argc == 0)
@@ -2013,11 +2442,14 @@ static void do_main_loop(int argc, char *argv[])
         // }
     }
 
-    unsigned int frame = 0;
-    
     uint64_t now_in_us = 0;
+    uint64_t peerNodeListCleanup = 0;
+    uint64_t loggerTS = 0;
+#ifdef SPI_DISPLAY_ENABLED
     uint64_t refreshDisplayTime = 0;
+#endif
     uint64_t discoverySend = 0;
+    
 
     if (codec2 == NULL)
     {
@@ -2031,27 +2463,46 @@ static void do_main_loop(int argc, char *argv[])
     {
         now_in_us = now_us();
 
+        if (now_in_us - loggerTS > (ONE_MS_IN_US * 2000))
+        {
+            loggerTS = now_in_us;
+            printf("Health message -> RFPower %d, Peer count: %d, Mesh ping TX: %lu, Mesh ping RX: %lu\nRSSI: %d, %d dBm, Noise: %d, %d dBm\n", 
+                rfPower, 
+                peer_count(), 
+                discoveryFrameTX, 
+                discoveryFrameRX, 
+                ant1RSSI_dBm, 
+                ant2RSSI_dBm, 
+                ant1Noise_dBm, 
+                ant2Noise_dBm
+            );
+        }
+
 #ifdef SPI_DISPLAY_ENABLED
+        doButtonStuff();
+
         if (usingDisplay){
             if (now_in_us - refreshDisplayTime > (ONE_MS_IN_US * 100))
             {
+#ifdef USE_INA219_SENSOR
+                read_ina219();
+#endif
                 refreshDisplayTime = now_in_us;
                 //Refresh the display here
-                //Do not refresh the display unless we got a new discovery message
-                if (discoveryFrameCounterOnLCD != discoveryFrameCounter)
-                {
-                    discoveryFrameCounterOnLCD = discoveryFrameCounter;
-                    update_display(discoveryFrameCounter, 4.2);
-                }
-
-                //Refresh the voltage of the INA219 sensor
+                update_display();
             }
         }
 #endif
 
+        if (now_in_us - peerNodeListCleanup > (ONE_MS_IN_US * 500))
+        {
+            peerNodeListCleanup = now_in_us;
+            peer_cleanup_old(now_in_us, (ONE_MS_IN_US * 500));
+        }
+
         if (isRadioTransmitting)
         {
-            if (now_in_us - discoverySend > (ONE_MS_IN_US * 1000))
+            if (now_in_us - discoverySend > (ONE_MS_IN_US * 100))
             {
                 discoverySend = now_in_us;
                 //printf("Sending discovery message...\n");
@@ -2091,20 +2542,6 @@ static void do_main_loop(int argc, char *argv[])
                     //TODO: implement error counter and abort if errors gets a handful.
                 }
             }
-            // else
-            // {
-            //     struct tpacket_hdr *hdr = (struct tpacket_hdr *)((uint8_t *)ring + frame * FRAME_SIZE);
-
-            //     if (!(hdr->tp_status & TP_STATUS_USER))
-            //         break; // No more frames in buffer
-
-            //     uint8_t *pkt = (uint8_t *)hdr + hdr->tp_mac;
-            //     size_t pktlen = hdr->tp_snaplen;
-            //     parse_radio_message(pkt, pktlen);
-
-            //     hdr->tp_status = TP_STATUS_KERNEL;
-            //     frame = (frame + 1) % frame_nr;
-            // }
         }
 
         audio_channel_timeout_check();
@@ -2143,16 +2580,12 @@ int main(int argc, char *argv[])
     {
         fill_screen_black();
     }
+#ifdef USE_INA219_SENSOR
+    setup_ina219();
+#endif
 #endif
 
-    if (argc == 1)
-    {
-        do_main_loop(0, argv);
-    }
-    else
-    {
-        do_main_loop(argc, argv);
-    }
+    do_main_loop(argc, argv);
 
     cleanup();
     return 0;
