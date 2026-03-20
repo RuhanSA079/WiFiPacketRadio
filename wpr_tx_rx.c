@@ -90,8 +90,8 @@ static int rfPower = 250;
 #define BUFFER_FRAMES (PERIOD_FRAMES * 4)   //Tunable??
 
 #define ONE_MS_IN_US 1000
-#define BUTTON_DEBOUNCE_US     20000ULL   // 20 ms
-#define BUTTON_LONG_PRESS_US  800000ULL   // 800 ms
+#define BUTTON_DEBOUNCE_US (ONE_MS_IN_US * 20)      // 20 ms
+#define BUTTON_LONG_PRESS_US  (ONE_MS_IN_US * 800)  // 800ms
 
 #ifdef SPI_DISPLAY_ENABLED
 static const char *SPI_DEV = "/dev/spidev0.0";
@@ -314,7 +314,6 @@ uint16_t framebuffer[TFT_WIDTH * TFT_HEIGHT];
 #define INA219_CFG_MODE_CONT        7u
 
 #define MAX_PEERS            32
-#define PEER_TIMEOUT_US      200000ULL   // 200 ms
 
 static struct peer_node local_peer_nodes[MAX_PEERS];
 static bool local_peer_used[MAX_PEERS];
