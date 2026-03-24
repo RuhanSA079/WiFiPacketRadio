@@ -16,6 +16,13 @@
  - Are un-acked "WiFi" radio data being transmitted, better than analog systems in terms of audio clarity/quality/range, or best to stick to analog for communications.
 
  The code is expected to compile on a ARM64 and AMD64 system.
+
+ NOTES:
+ - Implement dynamic datarate rx/tx to extend the range if message RSSI gets bad? (if datarate too low, scale power.)
+ - Implement dynamic RF power scaling as soon as threshold SNR or RSSI gets bad from one client. (The baddest RSSI determines the TX power)
+ - Permanently enable 40Mhz mode. Seems to fare a bit better on 40Mhz?
+ - Switch 2.4Ghz and 5Ghz on a press of a button.
+ - Manage MCS (datarates) manually?
 */
 
 #include <arpa/inet.h>
@@ -50,6 +57,7 @@
 //#include "ringbuffer.h"
 #include <alsa/asoundlib.h>
 #include <linux/i2c-dev.h>
+#include <linux/i2c.h>
 #include <sys/wait.h>
 #include <pthread.h>
 
@@ -60,9 +68,9 @@ static pthread_mutex_t peer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int rfPower = 3000;
 #else
 #define RADIO_IFACE "wlan1"
-#define SPI_DISPLAY_ENABLED true
+#define RASPBERRY_PI_PLATFORM true
 #include <gpiolib.h>
-#define USE_INA219_SENSOR
+#define USE_I2C
 static int rfPower = 250;
 #endif
 
@@ -93,7 +101,7 @@ static int rfPower = 250;
 #define BUTTON_DEBOUNCE_US (ONE_MS_IN_US * 20)      // 20 ms
 #define BUTTON_LONG_PRESS_US  (ONE_MS_IN_US * 800)  // 800ms
 
-#ifdef SPI_DISPLAY_ENABLED
+#ifdef RASPBERRY_PI_PLATFORM
 static const char *SPI_DEV = "/dev/spidev0.0";
 static const uint32_t SPI_SPEED = 32000000; // 32 MHz
 static const uint8_t SPI_MODE = SPI_MODE_0;
@@ -227,6 +235,109 @@ typedef struct {
     float current_lsb_a;   // amps per bit
 } ina219_t;
 
+/* 5x7 font (96 chars: ASCII 32..127)
+   Each character is 5 bytes (columns), LSB top. Standard tiny font.
+   Source: common 5x7 font table.
+*/
+static const uint8_t font5x7[96][5] = {
+    // space (32)
+    {0x00,0x00,0x00,0x00,0x00}, // ' '
+    {0x00,0x00,0x5F,0x00,0x00}, // !
+    {0x00,0x07,0x00,0x07,0x00}, // "
+    {0x14,0x7F,0x14,0x7F,0x14}, // #
+    {0x24,0x2A,0x7F,0x2A,0x12}, // $
+    {0x23,0x13,0x08,0x64,0x62}, // %
+    {0x36,0x49,0x55,0x22,0x50}, // &
+    {0x00,0x05,0x03,0x00,0x00}, // '
+    {0x00,0x1C,0x22,0x41,0x00}, // (
+    {0x00,0x41,0x22,0x1C,0x00}, // )
+    {0x14,0x08,0x3E,0x08,0x14}, // *
+    {0x08,0x08,0x3E,0x08,0x08}, // +
+    {0x00,0x50,0x30,0x00,0x00}, // ,
+    {0x08,0x08,0x08,0x08,0x08}, // -
+    {0x00,0x60,0x60,0x00,0x00}, // .
+    {0x20,0x10,0x08,0x04,0x02}, // /
+    {0x3E,0x51,0x49,0x45,0x3E}, // 0
+    {0x00,0x42,0x7F,0x40,0x00}, // 1
+    {0x72,0x49,0x49,0x49,0x46}, // 2
+    {0x21,0x41,0x49,0x4D,0x33}, // 3
+    {0x18,0x14,0x12,0x7F,0x10}, // 4
+    {0x27,0x45,0x45,0x45,0x39}, // 5
+    {0x3C,0x4A,0x49,0x49,0x30}, // 6
+    {0x01,0x71,0x09,0x05,0x03}, // 7
+    {0x36,0x49,0x49,0x49,0x36}, // 8
+    {0x06,0x49,0x49,0x29,0x1E}, // 9
+    {0x00,0x36,0x36,0x00,0x00}, // :
+    {0x00,0x56,0x36,0x00,0x00}, // ;
+    {0x08,0x14,0x22,0x41,0x00}, // <
+    {0x14,0x14,0x14,0x14,0x14}, // =
+    {0x00,0x41,0x22,0x14,0x08}, // >
+    {0x02,0x01,0x59,0x09,0x06}, // ?
+    {0x3E,0x41,0x5D,0x59,0x4E}, // @
+    {0x7C,0x12,0x11,0x12,0x7C}, // A
+    {0x7F,0x49,0x49,0x49,0x36}, // B
+    {0x3E,0x41,0x41,0x41,0x22}, // C
+    {0x7F,0x41,0x41,0x22,0x1C}, // D
+    {0x7F,0x49,0x49,0x49,0x41}, // E
+    {0x7F,0x09,0x09,0x09,0x01}, // F
+    {0x3E,0x41,0x49,0x49,0x7A}, // G
+    {0x7F,0x08,0x08,0x08,0x7F}, // H
+    {0x00,0x41,0x7F,0x41,0x00}, // I
+    {0x20,0x40,0x41,0x3F,0x01}, // J
+    {0x7F,0x08,0x14,0x22,0x41}, // K
+    {0x7F,0x40,0x40,0x40,0x40}, // L
+    {0x7F,0x02,0x04,0x02,0x7F}, // M
+    {0x7F,0x04,0x08,0x10,0x7F}, // N
+    {0x3E,0x41,0x41,0x41,0x3E}, // O
+    {0x7F,0x09,0x09,0x09,0x06}, // P
+    {0x3E,0x41,0x51,0x21,0x5E}, // Q
+    {0x7F,0x09,0x19,0x29,0x46}, // R
+    {0x46,0x49,0x49,0x49,0x31}, // S
+    {0x01,0x01,0x7F,0x01,0x01}, // T
+    {0x3F,0x40,0x40,0x40,0x3F}, // U
+    {0x1F,0x20,0x40,0x20,0x1F}, // V
+    {0x3F,0x40,0x38,0x40,0x3F}, // W
+    {0x63,0x14,0x08,0x14,0x63}, // X
+    {0x07,0x08,0x70,0x08,0x07}, // Y
+    {0x61,0x51,0x49,0x45,0x43}, // Z
+    {0x00,0x7F,0x41,0x41,0x00}, // [
+    {0x02,0x04,0x08,0x10,0x20}, // backslash
+    {0x00,0x41,0x41,0x7F,0x00}, // ]
+    {0x04,0x02,0x01,0x02,0x04}, // ^
+    {0x40,0x40,0x40,0x40,0x40}, // _
+    {0x00,0x01,0x02,0x04,0x00}, // `
+    {0x20,0x54,0x54,0x54,0x78}, // a
+    {0x7F,0x48,0x44,0x44,0x38}, // b
+    {0x38,0x44,0x44,0x44,0x20}, // c
+    {0x38,0x44,0x44,0x48,0x7F}, // d
+    {0x38,0x54,0x54,0x54,0x18}, // e
+    {0x08,0x7E,0x09,0x01,0x02}, // f
+    {0x0C,0x52,0x52,0x52,0x3E}, // g
+    {0x7F,0x08,0x04,0x04,0x78}, // h
+    {0x00,0x44,0x7D,0x40,0x00}, // i
+    {0x20,0x40,0x44,0x3D,0x00}, // j
+    {0x7F,0x10,0x28,0x44,0x00}, // k
+    {0x00,0x41,0x7F,0x40,0x00}, // l
+    {0x7C,0x04,0x18,0x04,0x78}, // m
+    {0x7C,0x08,0x04,0x04,0x78}, // n
+    {0x38,0x44,0x44,0x44,0x38}, // o
+    {0x7C,0x14,0x14,0x14,0x08}, // p
+    {0x08,0x14,0x14,0x18,0x7C}, // q
+    {0x7C,0x08,0x04,0x04,0x08}, // r
+    {0x48,0x54,0x54,0x54,0x20}, // s
+    {0x04,0x3F,0x44,0x40,0x20}, // t
+    {0x3C,0x40,0x40,0x20,0x7C}, // u
+    {0x1C,0x20,0x40,0x20,0x1C}, // v
+    {0x3C,0x40,0x30,0x40,0x3C}, // w
+    {0x44,0x28,0x10,0x28,0x44}, // x
+    {0x0C,0x50,0x50,0x50,0x3C}, // y
+    {0x44,0x64,0x54,0x4C,0x44}, // z
+    {0x00,0x08,0x36,0x41,0x00}, // {
+    {0x00,0x00,0x7F,0x00,0x00}, // |
+    {0x00,0x41,0x36,0x08,0x00}, // }
+    {0x10,0x08,0x08,0x10,0x08}, // ~
+};
+
 /* ---------------- some variables ---------------- */
 
 
@@ -245,6 +356,8 @@ bool isRadioTransmitting = false;
 bool useQDiscBypass = true;
 bool usingPcap = true;
 bool usingDisplay = false;
+bool isSSD1306Detected = false;
+bool isINA219Detected = false;
 static double phase = 0.0;
 
 uint64_t last_tx_test_tone = 0;
@@ -262,15 +375,17 @@ struct radiotap_hdr rtap_tx;
 
 static struct audio_channel_state channels[4];
 static struct wpr_queue tx_queue;
-#ifdef USE_INA219_SENSOR
+
 static uint16_t ina219_bus_mv = 0;
 static float ina219_current_ma = 0;
-#endif
 ina219_t ina;
 int8_t ant1RSSI_dBm = -120;
 int8_t ant2RSSI_dBm = -120;
 int8_t ant1Noise_dBm = -120;
 int8_t ant2Noise_dBm = -120;
+
+//SSD1306 LCD page number:
+int ssd1306_page = 0;
 
 #define PCM_BYTE_COUNT 160                             /* 20 ms of mono audio at 8 kHz */
 #define PCM_100MS_BYTE_COUNT (PCM_BYTE_COUNT * 5)      // enough for 100 ms of audio, 160 bytes per 20 ms frame * 5 = 800 bytes
@@ -313,10 +428,18 @@ uint16_t framebuffer[TFT_WIDTH * TFT_HEIGHT];
 #define INA219_CFG_SADC_12BIT       (3u << 3)
 #define INA219_CFG_MODE_CONT        7u
 
-#define MAX_PEERS            32
+#define MAX_WPR_PEERS            32
 
-static struct peer_node local_peer_nodes[MAX_PEERS];
-static bool local_peer_used[MAX_PEERS];
+#define SSD1306_I2C_ADDR    0x3C
+#define SSD1306_WIDTH       64
+#define SSD1306_HEIGHT      64
+#define SSD1306_PAGES       (SSD1306_HEIGHT / 8)
+#define SSD1306_COL_OFFSET  32   // change if your module needs an offset
+
+static uint8_t ssd1306_framebuffer[SSD1306_WIDTH * SSD1306_PAGES];
+
+static struct peer_node local_peer_nodes[MAX_WPR_PEERS];
+static bool local_peer_used[MAX_WPR_PEERS];
 
 unsigned gpio_rst, gpio_cmd, gpio_bl = 0;
 
@@ -329,7 +452,7 @@ char *mac_to_string(const uint8_t mac[6])
 
 static int peer_find_index(const uint8_t mac[6])
 {
-    for (int i = 0; i < MAX_PEERS; i++) {
+    for (int i = 0; i < MAX_WPR_PEERS; i++) {
         if (local_peer_used[i] &&
             memcmp(local_peer_nodes[i].nodeID, mac, 6) == 0) {
             return i;
@@ -340,7 +463,7 @@ static int peer_find_index(const uint8_t mac[6])
 
 static int peer_find_free_index(void)
 {
-    for (int i = 0; i < MAX_PEERS; i++) {
+    for (int i = 0; i < MAX_WPR_PEERS; i++) {
         if (!local_peer_used[i]) {
             return i;
         }
@@ -381,7 +504,7 @@ static int peer_count(void)
     pthread_mutex_lock(&peer_mutex);
     int count = 0;
 
-    for (int i = 0; i < MAX_PEERS; i++) {
+    for (int i = 0; i < MAX_WPR_PEERS; i++) {
         if (local_peer_used[i]) {
             count++;
         }
@@ -394,7 +517,7 @@ static int peer_count(void)
 static void peer_cleanup_old(uint64_t now, uint64_t cleanupTime)
 {
     pthread_mutex_lock(&peer_mutex);
-    for (int i = 0; i < MAX_PEERS; i++) {
+    for (int i = 0; i < MAX_WPR_PEERS; i++) {
         if (!local_peer_used[i]) {
             continue;
         }
@@ -586,7 +709,7 @@ static void setRFPower(int power)
     run_cmd(cmd);
 }
 
-#ifdef SPI_DISPLAY_ENABLED
+#ifdef RASPBERRY_PI_PLATFORM
 
 #define X_OFFSET 2
 #define Y_OFFSET 1
@@ -702,109 +825,6 @@ static bool init_spi_display(){
     gpio_set(SPI_DISPLAY_BKL);
     return true;
 }
-
-/* 5x7 font (96 chars: ASCII 32..127)
-   Each character is 5 bytes (columns), LSB top. Standard tiny font.
-   Source: common 5x7 font table.
-*/
-static const uint8_t font5x7[96][5] = {
-    // space (32)
-    {0x00,0x00,0x00,0x00,0x00}, // ' '
-    {0x00,0x00,0x5F,0x00,0x00}, // !
-    {0x00,0x07,0x00,0x07,0x00}, // "
-    {0x14,0x7F,0x14,0x7F,0x14}, // #
-    {0x24,0x2A,0x7F,0x2A,0x12}, // $
-    {0x23,0x13,0x08,0x64,0x62}, // %
-    {0x36,0x49,0x55,0x22,0x50}, // &
-    {0x00,0x05,0x03,0x00,0x00}, // '
-    {0x00,0x1C,0x22,0x41,0x00}, // (
-    {0x00,0x41,0x22,0x1C,0x00}, // )
-    {0x14,0x08,0x3E,0x08,0x14}, // *
-    {0x08,0x08,0x3E,0x08,0x08}, // +
-    {0x00,0x50,0x30,0x00,0x00}, // ,
-    {0x08,0x08,0x08,0x08,0x08}, // -
-    {0x00,0x60,0x60,0x00,0x00}, // .
-    {0x20,0x10,0x08,0x04,0x02}, // /
-    {0x3E,0x51,0x49,0x45,0x3E}, // 0
-    {0x00,0x42,0x7F,0x40,0x00}, // 1
-    {0x72,0x49,0x49,0x49,0x46}, // 2
-    {0x21,0x41,0x49,0x4D,0x33}, // 3
-    {0x18,0x14,0x12,0x7F,0x10}, // 4
-    {0x27,0x45,0x45,0x45,0x39}, // 5
-    {0x3C,0x4A,0x49,0x49,0x30}, // 6
-    {0x01,0x71,0x09,0x05,0x03}, // 7
-    {0x36,0x49,0x49,0x49,0x36}, // 8
-    {0x06,0x49,0x49,0x29,0x1E}, // 9
-    {0x00,0x36,0x36,0x00,0x00}, // :
-    {0x00,0x56,0x36,0x00,0x00}, // ;
-    {0x08,0x14,0x22,0x41,0x00}, // <
-    {0x14,0x14,0x14,0x14,0x14}, // =
-    {0x00,0x41,0x22,0x14,0x08}, // >
-    {0x02,0x01,0x59,0x09,0x06}, // ?
-    {0x3E,0x41,0x5D,0x59,0x4E}, // @
-    {0x7C,0x12,0x11,0x12,0x7C}, // A
-    {0x7F,0x49,0x49,0x49,0x36}, // B
-    {0x3E,0x41,0x41,0x41,0x22}, // C
-    {0x7F,0x41,0x41,0x22,0x1C}, // D
-    {0x7F,0x49,0x49,0x49,0x41}, // E
-    {0x7F,0x09,0x09,0x09,0x01}, // F
-    {0x3E,0x41,0x49,0x49,0x7A}, // G
-    {0x7F,0x08,0x08,0x08,0x7F}, // H
-    {0x00,0x41,0x7F,0x41,0x00}, // I
-    {0x20,0x40,0x41,0x3F,0x01}, // J
-    {0x7F,0x08,0x14,0x22,0x41}, // K
-    {0x7F,0x40,0x40,0x40,0x40}, // L
-    {0x7F,0x02,0x04,0x02,0x7F}, // M
-    {0x7F,0x04,0x08,0x10,0x7F}, // N
-    {0x3E,0x41,0x41,0x41,0x3E}, // O
-    {0x7F,0x09,0x09,0x09,0x06}, // P
-    {0x3E,0x41,0x51,0x21,0x5E}, // Q
-    {0x7F,0x09,0x19,0x29,0x46}, // R
-    {0x46,0x49,0x49,0x49,0x31}, // S
-    {0x01,0x01,0x7F,0x01,0x01}, // T
-    {0x3F,0x40,0x40,0x40,0x3F}, // U
-    {0x1F,0x20,0x40,0x20,0x1F}, // V
-    {0x3F,0x40,0x38,0x40,0x3F}, // W
-    {0x63,0x14,0x08,0x14,0x63}, // X
-    {0x07,0x08,0x70,0x08,0x07}, // Y
-    {0x61,0x51,0x49,0x45,0x43}, // Z
-    {0x00,0x7F,0x41,0x41,0x00}, // [
-    {0x02,0x04,0x08,0x10,0x20}, // backslash
-    {0x00,0x41,0x41,0x7F,0x00}, // ]
-    {0x04,0x02,0x01,0x02,0x04}, // ^
-    {0x40,0x40,0x40,0x40,0x40}, // _
-    {0x00,0x01,0x02,0x04,0x00}, // `
-    {0x20,0x54,0x54,0x54,0x78}, // a
-    {0x7F,0x48,0x44,0x44,0x38}, // b
-    {0x38,0x44,0x44,0x44,0x20}, // c
-    {0x38,0x44,0x44,0x48,0x7F}, // d
-    {0x38,0x54,0x54,0x54,0x18}, // e
-    {0x08,0x7E,0x09,0x01,0x02}, // f
-    {0x0C,0x52,0x52,0x52,0x3E}, // g
-    {0x7F,0x08,0x04,0x04,0x78}, // h
-    {0x00,0x44,0x7D,0x40,0x00}, // i
-    {0x20,0x40,0x44,0x3D,0x00}, // j
-    {0x7F,0x10,0x28,0x44,0x00}, // k
-    {0x00,0x41,0x7F,0x40,0x00}, // l
-    {0x7C,0x04,0x18,0x04,0x78}, // m
-    {0x7C,0x08,0x04,0x04,0x78}, // n
-    {0x38,0x44,0x44,0x44,0x38}, // o
-    {0x7C,0x14,0x14,0x14,0x08}, // p
-    {0x08,0x14,0x14,0x18,0x7C}, // q
-    {0x7C,0x08,0x04,0x04,0x08}, // r
-    {0x48,0x54,0x54,0x54,0x20}, // s
-    {0x04,0x3F,0x44,0x40,0x20}, // t
-    {0x3C,0x40,0x40,0x20,0x7C}, // u
-    {0x1C,0x20,0x40,0x20,0x1C}, // v
-    {0x3C,0x40,0x30,0x40,0x3C}, // w
-    {0x44,0x28,0x10,0x28,0x44}, // x
-    {0x0C,0x50,0x50,0x50,0x3C}, // y
-    {0x44,0x64,0x54,0x4C,0x44}, // z
-    {0x00,0x08,0x36,0x41,0x00}, // {
-    {0x00,0x00,0x7F,0x00,0x00}, // |
-    {0x00,0x41,0x36,0x08,0x00}, // }
-    {0x10,0x08,0x08,0x10,0x08}, // ~
-};
 
 // Helper: convert 8-bit RGB to RGB565 
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
@@ -948,7 +968,7 @@ static void clear_screen(uint16_t bg_color)
 }
 
 // Compose and update the fields: battery, version, center counter, heart state
-static void update_display()
+static void update_st7735_display()
 {
     int peers_count = peer_count();
     // colors
@@ -1059,10 +1079,13 @@ static void update_display()
 
 #endif
 
-#ifdef USE_INA219_SENSOR
-
 static int ina219_write_u16(int fd, uint8_t reg, uint16_t value)
 {
+    if (ioctl(fd, I2C_SLAVE, INA219_SENSOR_ADDR) < 0) {
+        printf("INA219 fault detected \n");
+        return -1;
+    }
+
     uint8_t buf[3];
     buf[0] = reg;
     buf[1] = (uint8_t)(value >> 8);   // MSB first
@@ -1073,6 +1096,11 @@ static int ina219_write_u16(int fd, uint8_t reg, uint16_t value)
 
 static int ina219_read_u16(int fd, uint8_t reg, uint16_t *value)
 {
+    if (ioctl(fd, I2C_SLAVE, INA219_SENSOR_ADDR) < 0) {
+        printf("INA219 fault detected \n");
+        return -1;
+    }
+
     uint8_t r = reg;
     uint8_t buf[2];
 
@@ -1093,7 +1121,6 @@ static int ina219_init(ina219_t *dev, int fd, uint8_t addr, float shunt_ohms, fl
     if (ioctl(fd, I2C_SLAVE, addr) < 0) {
         printf("INA219 fault detected \n");
         dev->fd = -1;
-        close(i2c_fd);
         return -1;
     }
 
@@ -1174,25 +1201,29 @@ static int ina219_read_current_ma(ina219_t *dev, float *current_ma)
     return 0;
 }
 
-static void setup_ina219(void)
+static void setup_ina219(int fd)
 {
-    printf("Setting up i2c-bus...\n");
-
-    i2c_fd = open("/dev/i2c-1", O_RDWR);
-    if (i2c_fd < 0) {
-        perror("Failed to open I2C bus");
-    }
-
-    if (ina219_init(&ina, i2c_fd, 0x40, 0.1f, 3.2f) < 0) {
+    if (ina219_init(&ina, fd, 0x40, 0.1f, 3.2f) < 0) {
         printf("Unable to init INA219 sensor...");
-    }
+    }else{
+        printf("INA219 sensor initialized successfully.\n");
+    }   
 }
 
 static void read_ina219(void)
 {
-    if (ina.fd <= 0){
+    if (!isINA219Detected){
+        ina219_bus_mv = 0;
+        ina219_current_ma = 0;
         return;
     }
+
+    if (ina.fd <= 0){
+        ina219_bus_mv = 0;
+        ina219_current_ma = 0;
+        return;
+    }
+
 
     if (!(ina219_read_bus_voltage_mv(&ina, &ina219_bus_mv) == 0 && ina219_read_current_ma(&ina, &ina219_current_ma) == 0))
     {
@@ -1200,8 +1231,6 @@ static void read_ina219(void)
         ina219_current_ma = 0;
     }
 }
-
-#endif
 
 static void setup_radio_monitor(void)
 {
@@ -2302,7 +2331,253 @@ static void printParameters(void)
     printf("Parameters: <programName> <rx/tx> <audiofilename-to-tx>\n");
 }
 
-#ifdef SPI_DISPLAY_ENABLED
+static int ssd1306_i2c_write_cmds(const uint8_t *cmds, size_t len)
+{
+    if (ioctl(i2c_fd, I2C_SLAVE, SSD1306_I2C_ADDR) < 0) {
+        printf("SSD1306 fault detected \n");
+        return -1;
+    }
+
+    uint8_t buf[64];
+
+    if (len + 1 > sizeof(buf)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    buf[0] = 0x00; // command prefix
+    memcpy(&buf[1], cmds, len);
+
+    if (write(i2c_fd, buf, len + 1) != (ssize_t)(len + 1))
+        return -1;
+
+    return 0;
+}
+
+static int ssd1306_i2c_write_data(const uint8_t *data, size_t len)
+{
+    if (ioctl(i2c_fd, I2C_SLAVE, SSD1306_I2C_ADDR) < 0) {
+        printf("SSD1306 fault detected \n");
+        return -1;
+    }
+
+    uint8_t buf[1 + SSD1306_WIDTH];
+
+    if (len > SSD1306_WIDTH) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    buf[0] = 0x40; // data prefix
+    memcpy(&buf[1], data, len);
+
+    if (write(i2c_fd, buf, len + 1) != (ssize_t)(len + 1))
+        return -1;
+
+    return 0;
+}
+
+static int ssd1306_init(void)
+{
+    const uint8_t cmds[] = {
+        0xAE,             // display off
+        0xD5, 0x80,       // clock divide
+        0xA8, 0x3F,       // multiplex = 64
+        0xD3, 0x00,       // display offset
+        0x40,             // start line
+        0x8D, 0x14,       // charge pump on
+        0x20, 0x00,       // horizontal addressing mode
+        0xA1,             // segment remap
+        0xC8,             // COM scan direction remap
+        0xDA, 0x12,       // COM pins config for 64px tall panel
+        0x81, 0x7F,       // contrast
+        0xD9, 0xF1,       // pre-charge
+        0xDB, 0x40,       // VCOM detect
+        0xA4,             // resume RAM content display
+        0xA6,             // normal display
+        0x2E,             // deactivate scroll
+        0xAF              // display on
+    };
+
+    return ssd1306_i2c_write_cmds(cmds, sizeof(cmds));
+}
+
+static void ssd1306_fb_clear(void)
+{
+    memset(ssd1306_framebuffer, 0, sizeof(ssd1306_framebuffer));
+}
+
+static void ssd1306_fb_set_pixel(int x, int y, int on)
+{
+    if (x < 0 || x >= SSD1306_WIDTH || y < 0 || y >= SSD1306_HEIGHT)
+        return;
+
+    uint16_t index = (uint16_t)x + (uint16_t)(y / 8) * SSD1306_WIDTH;
+    uint8_t mask = (uint8_t)(1u << (y & 7));
+
+    if (on)
+        ssd1306_framebuffer[index] |= mask;
+    else
+        ssd1306_framebuffer[index] &= (uint8_t)~mask;
+}
+
+static void ssd1306_draw_char_5x7(int x, int y, char ch)
+{
+    if (ch < 32 || ch > 127)
+        ch = '?';
+
+    const uint8_t *glyph = font5x7[(int)ch - 32];
+
+    // 5 columns wide, 7 pixels tall, plus 1 column spacing
+    for (int col = 0; col < 5; col++) {
+        uint8_t bits = glyph[col];
+
+        for (int row = 0; row < 7; row++) {
+            if (bits & (1u << row)) {
+                ssd1306_fb_set_pixel(x + col, y + row, 1);
+            }
+        }
+    }
+}
+
+static void ssd1306_draw_text_5x7(int x, int y, const char *s)
+{
+    while (*s) {
+        if (*s == '\n') {
+            x = 0;
+            y += 8;   // 7px glyph + 1px spacing
+        } else {
+            ssd1306_draw_char_5x7(x, y, *s);
+            x += 6;   // 5px glyph + 1px spacing
+        }
+        s++;
+    }
+}
+
+static int ssd1306_update(void)
+{
+    for (int page = 0; page < SSD1306_PAGES; ++page) {
+        uint8_t cmds[] = {
+            0x21, SSD1306_COL_OFFSET, SSD1306_COL_OFFSET + SSD1306_WIDTH - 1,
+            0x22, page, page
+        };
+
+        if (ssd1306_i2c_write_cmds(cmds, sizeof(cmds)) < 0)
+            return -1;
+
+        if (ssd1306_i2c_write_data(&ssd1306_framebuffer[page * SSD1306_WIDTH], SSD1306_WIDTH) < 0)
+            return -1;
+    }
+
+    return 0;
+}
+
+static void updateSSD1306(void)
+{
+    //Draw the chars, then update the display.
+    ssd1306_fb_clear();
+
+    switch(ssd1306_page){
+    case 0:
+        //Home page: App name, peer count, RF power, voltage, current page number (1/2)
+        ssd1306_draw_text_5x7(0, 16, "WPR--RUHAN");
+        char peerCountStr[16];
+        snprintf(peerCountStr, sizeof(peerCountStr), "Peers: %d", peer_count());
+        ssd1306_draw_text_5x7(0, 24, peerCountStr);
+        char rfPow[16];
+        snprintf(rfPow, sizeof(rfPow), "RFP: %d", rfPower);
+        ssd1306_draw_text_5x7(0, 32, rfPow);
+
+        char voltageStr[16];
+        snprintf(voltageStr, sizeof(voltageStr), "V: %.2f V", (float)(ina219_bus_mv/1000.0));
+        ssd1306_draw_text_5x7(0, 40, voltageStr);
+
+        char currentStr[16];
+        snprintf(currentStr, sizeof(currentStr), "A: %.0f mA", (float)ina219_current_ma);
+        ssd1306_draw_text_5x7(0, 48, currentStr);
+
+        char powerStr[16];
+        snprintf(powerStr, sizeof(powerStr), "P: %.1f W", ((float)(ina219_bus_mv/1000.0)) * ((float)ina219_current_ma/1000.0));
+
+        ssd1306_draw_text_5x7(0, 56, powerStr);
+        break;
+    case 1:
+        char rssiStr[16];
+        snprintf(rssiStr, sizeof(rssiStr), "A1: %d", ant1RSSI_dBm);
+        ssd1306_draw_text_5x7(0, 16, rssiStr);
+        char noiseStr[16];
+        snprintf(noiseStr, sizeof(noiseStr), "N1: %d", ant1Noise_dBm);
+        ssd1306_draw_text_5x7(0, 24, noiseStr);
+        char rssi2Str[16];
+        snprintf(rssi2Str, sizeof(rssi2Str), "A2: %d", ant2RSSI_dBm);
+        ssd1306_draw_text_5x7(0, 32, rssi2Str);
+        char noise2Str[16];
+        snprintf(noise2Str, sizeof(noise2Str), "N2: %d", ant2Noise_dBm);
+        ssd1306_draw_text_5x7(0, 40, noise2Str);
+
+        char txStr[16];
+        snprintf(txStr, sizeof(txStr), "TX: %ld", discoveryFrameTX);
+        ssd1306_draw_text_5x7(0, 48, txStr);
+        char rxStr[16];
+        snprintf(rxStr, sizeof(rxStr), "RX: %ld", discoveryFrameRX);
+        ssd1306_draw_text_5x7(0, 56, rxStr);
+
+        break;
+    // case 2:
+    //     ssd1306_draw_text_5x7(0, 0, "RF Power:");
+    //     char rfPowerStr[16];
+    //     snprintf(rfPowerStr, sizeof(rfPowerStr), "%d", rfPower);
+    //     ssd1306_draw_text_5x7(60, 0, rfPowerStr);
+    //     break;
+    default:
+        break;
+    }
+    // ssd1306_draw_text_5x7(0, 16, "123456789a");
+    // ssd1306_draw_text_5x7(0, 24, "-1-2-3-4-5-");
+    // ssd1306_draw_text_5x7(0, 32, "-6-7-8-9-0-");
+    // ssd1306_draw_text_5x7(0, 40, "PWR: 1000");
+    // ssd1306_draw_text_5x7(0, 48, "SNR: 20 dB");
+    // ssd1306_draw_text_5x7(0, 56, "WPR-RUHAN");
+    // char peerCountStr[16];
+    // snprintf(peerCountStr, sizeof(peerCountStr), "%d", peer_count());
+    // ssd1306_draw_text_5x7(36, 8, peerCountStr);
+    // ssd1306_draw_text_5x7(0, 16, "RF Power:");
+    // char rfPowerStr[16];
+    // snprintf(rfPowerStr, sizeof(rfPowerStr), "%d", rfPower);
+    // ssd1306_draw_text_5x7(60, 16, rfPowerStr);
+    
+    if (ssd1306_update() < 0) {
+        fprintf(stderr, "Failed to update SSD1306 display: %s\n", strerror(errno));
+    }
+}
+
+static bool detect_i2c_device(int fd, uint8_t addr)
+{
+    if (ioctl(fd, I2C_SLAVE, addr) < 0) {
+        perror("ioctl(I2C_SLAVE)");
+        return -1;
+    }
+    
+    struct i2c_msg msg;
+    struct i2c_rdwr_ioctl_data packets;
+    uint8_t dummy = 0;
+
+    msg.addr  = addr;
+    msg.flags = 0;          // write
+    msg.len   = 1;
+    msg.buf   = &dummy;
+
+    packets.msgs  = &msg;
+    packets.nmsgs = 1;
+
+    if (ioctl(fd, I2C_RDWR, &packets) < 0) {
+        return false; // no response (NACK or error)
+    }
+
+    return true; // device acknowledged
+}
+
+#ifdef RASPBERRY_PI_PLATFORM
 static button_event_t button_update(void)
 {
     static bool last_raw = false;
@@ -2444,7 +2719,7 @@ static void do_main_loop(int argc, char *argv[])
     uint64_t now_in_us = 0;
     uint64_t peerNodeListCleanup = 0;
     uint64_t loggerTS = 0;
-#ifdef SPI_DISPLAY_ENABLED
+#ifdef RASPBERRY_PI_PLATFORM
     uint64_t refreshDisplayTime = 0;
 #endif
     uint64_t discoverySend = 0;
@@ -2464,31 +2739,64 @@ static void do_main_loop(int argc, char *argv[])
 
         if (now_in_us - loggerTS > (ONE_MS_IN_US * 2000))
         {
+            #ifdef USE_I2C
+                read_ina219();
+            #endif
+
+            ssd1306_page++;
+            if (ssd1306_page >= 2){
+                ssd1306_page = 0;
+            }
+
             loggerTS = now_in_us;
-            printf("Health message -> RFPower %d, Peer count: %d, Mesh ping TX: %lu, Mesh ping RX: %lu\nRSSI: %d, %d dBm, Noise: %d, %d dBm\n", 
-                rfPower, 
-                peer_count(), 
-                discoveryFrameTX, 
-                discoveryFrameRX, 
-                ant1RSSI_dBm, 
-                ant2RSSI_dBm, 
-                ant1Noise_dBm, 
-                ant2Noise_dBm
-            );
+            if (isINA219Detected){
+                printf("Health message -> RFPower %d, Peer count: %d, Mesh ping TX: %lu, Mesh ping RX: %lu\nRSSI: %d, %d dBm, Noise: %d, %d dBm\nVoltage: %.2f V, Current: %f mA\n", 
+                    rfPower, 
+                    peer_count(), 
+                    discoveryFrameTX,
+                    discoveryFrameRX, 
+                    ant1RSSI_dBm, 
+                    ant2RSSI_dBm, 
+                    ant1Noise_dBm, 
+                    ant2Noise_dBm,
+                    ((float)ina219_bus_mv / 1000.0f),
+                    ina219_current_ma
+                );
+            }
+            else{
+                printf("Health message -> RFPower %d, Peer count: %d, Mesh ping TX: %lu, Mesh ping RX: %lu\nRSSI: %d, %d dBm, Noise: %d, %d dBm\n", 
+                    rfPower, 
+                    peer_count(), 
+                    discoveryFrameTX, 
+                    discoveryFrameRX, 
+                    ant1RSSI_dBm, 
+                    ant2RSSI_dBm, 
+                    ant1Noise_dBm, 
+                    ant2Noise_dBm
+                );
+            }
         }
 
-#ifdef SPI_DISPLAY_ENABLED
+
+
+#ifdef RASPBERRY_PI_PLATFORM
         doButtonStuff();
 
         if (usingDisplay){
             if (now_in_us - refreshDisplayTime > (ONE_MS_IN_US * 100))
             {
-#ifdef USE_INA219_SENSOR
-                read_ina219();
-#endif
+                #ifdef USE_I2C
+                    read_ina219();
+                #endif
+
                 refreshDisplayTime = now_in_us;
+
                 //Refresh the display here
-                update_display();
+                update_st7735_display();
+
+                if (isSSD1306Detected){
+                    updateSSD1306();
+                }
             }
         }
 #endif
@@ -2545,7 +2853,7 @@ static void do_main_loop(int argc, char *argv[])
 
         audio_channel_timeout_check();
 
-        usleep(10); // Allow other processes CPU time
+        usleep(5); // Allow other processes CPU time
     }
 }
 
@@ -2569,7 +2877,7 @@ int main(int argc, char *argv[])
         perror("setpriority failed (are you root?)");
     }
 
-#ifdef SPI_DISPLAY_ENABLED
+#ifdef RASPBERRY_PI_PLATFORM
     printf("Enabling SPI display...\n");
     usingDisplay = init_spi_display();
     if (!usingDisplay){
@@ -2579,9 +2887,37 @@ int main(int argc, char *argv[])
     {
         fill_screen_black();
     }
-#ifdef USE_INA219_SENSOR
-    setup_ina219();
 #endif
+
+#ifdef USE_I2C
+    printf("Setting up i2c-bus...\n");
+
+    i2c_fd = open("/dev/i2c-1", O_RDWR);
+    if (i2c_fd < 0) {
+        perror("Failed to open I2C bus");
+    }
+
+    isINA219Detected = detect_i2c_device(i2c_fd, INA219_SENSOR_ADDR);
+    isSSD1306Detected = detect_i2c_device(i2c_fd, SSD1306_I2C_ADDR);
+    
+    if (isINA219Detected) {
+        printf("INA219 sensor detected, initializing...\n");
+        setup_ina219(i2c_fd);
+    } else {
+        printf("INA219 sensor not detected on I2C bus.\n");
+    }
+
+    
+    if (isSSD1306Detected) {
+        printf("SSD1306 display detected, initializing...\n");
+        if (ssd1306_init() < 0) {
+            fprintf(stderr, "Failed to initialize SSD1306 display: %s\n", strerror(errno));
+            usingDisplay = false;
+        }
+    } else {
+        printf("SSD1306 display not detected on I2C bus.\n");
+    }
+
 #endif
 
     do_main_loop(argc, argv);
